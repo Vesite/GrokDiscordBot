@@ -1,4 +1,4 @@
-
+Uses the python package manager uv
 
 Requires a "keys.json" file to function. This is not a part of the repository
 
