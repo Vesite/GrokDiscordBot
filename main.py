@@ -1,10 +1,10 @@
 import json
 import discord
-import requests
 import aiohttp  # For making async HTTP requests
 import asyncio
 from discord.ext import commands
 from discord import app_commands
+
 
 # Read the sensitive data from the file
 with open('keys.json', 'r') as file:
