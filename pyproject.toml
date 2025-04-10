@@ -8,4 +8,5 @@ dependencies = [
     "aiohttp>=3.11.16",
     "asyncio>=3.4.3",
     "discord>=2.3.2",
+    "openai>=1.72.0",
 ]
