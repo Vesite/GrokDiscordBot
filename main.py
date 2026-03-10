@@ -152,8 +152,8 @@ async def on_message(message):
 
     print(f"¤Bot Final Message: {response}")
 
-    if random.random() < 0.01:
-        response += " (btw i killed Romiko)"
+    # if random.random() < 0.01:
+    #     response += " (btw i killed Romiko)"
 
     if len(response) > 1900:
         await message.reply(response[:1900] + "... (message limit reached)")
