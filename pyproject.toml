@@ -5,8 +5,12 @@ description = "Discord bot made with python using xAI API"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "aiohttp>=3.11.16",
-    "asyncio>=3.4.3",
-    "discord>=2.3.2",
-    "openai>=1.72.0",
+    "discord.py>=2.7.1",
+    "openai>=3.1.0",
 ]
+
+[tool.uv]
+# The uv cache is on C: and this project is on D:. Windows cannot hardlink
+# across volumes, so uv tries, fails, and warns on every command. Copying is
+# what it falls back to anyway, so ask for it directly.
+link-mode = "copy"

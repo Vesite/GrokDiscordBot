@@ -1,14 +1,11 @@
 import json
 import random
 import discord
-import aiohttp  # For making async HTTP requests
 import asyncio
 import os
 from datetime import datetime, timezone
 from discord.ext import commands
 from discord import app_commands
-import re
-from openai import OpenAI
 from openai import AsyncOpenAI
 
 
@@ -46,6 +43,21 @@ DISCORD_TOKEN = secrets["discord_bot_token"]
 GROK_KEY = secrets["grok_key"]
 
 timeout_seconds = 50
+
+# ── Model config ─────────────────────────────────────────────────────────────
+# grok-4-1-fast-non-reasoning was retired 2026-05-15. The old slug still
+# resolves, but it silently redirects to grok-4.3 and bills at grok-4.3 rates,
+# so name the model explicitly instead of relying on the redirect.
+# grok-4.3: 1M context, $1.25/1M input, $2.50/1M output.
+CHAT_MODEL = "grok-4.3"
+SEARCH_MODEL = "grok-4.3"
+IMAGE_MODEL = "grok-imagine-image"
+
+# "none" keeps the old fast non-reasoning behaviour. Verified against the API:
+# 0 reasoning tokens billed, ~1.3s replies. "low" burns ~95 reasoning tokens per
+# reply and is slower, so only switch if answers start feeling too dumb.
+REASONING_EFFORT = "none"
+# ─────────────────────────────────────────────────────────────────────────────
 
 client = AsyncOpenAI(
     api_key=GROK_KEY,
@@ -113,7 +125,10 @@ async def on_message(message):
 
     if message.reference:
         referenced_message = message.reference.resolved
-        if referenced_message and referenced_message.attachments:
+        # resolved is None if it was never cached, and a DeletedReferencedMessage
+        # if the replied-to message is gone. Neither of those has .attachments,
+        # so only a real Message is safe to read from.
+        if isinstance(referenced_message, discord.Message) and referenced_message.attachments:
             all_attachments.extend(referenced_message.attachments)
 
     history = await get_conversation_history(message)
@@ -144,16 +159,26 @@ async def on_message(message):
         system_extra = ""
         user_content = user_input
 
+    # The first system message is byte-identical on every request, so it is the
+    # part prompt caching can reuse. Anything that varies per message goes in a
+    # second system message after it, otherwise the cached prefix is broken.
+    input_messages = [{"role": "system", "content": role_description + emoji_list}]
+    if role_description_extra or system_extra:
+        input_messages.append({"role": "system", "content": role_description_extra + system_extra})
+    input_messages.extend(history)
+    input_messages.append({"role": "user", "content": user_content})
+
     async with message.channel.typing():
         try:
             response_obj = await asyncio.wait_for(
                 client.responses.create(
-                    model="grok-4-1-fast-non-reasoning",
-                    input=[
-                        {"role": "system", "content": role_description + emoji_list + role_description_extra + system_extra},
-                        *history,
-                        {"role": "user", "content": user_content},
-                    ],
+                    model=CHAT_MODEL,
+                    input=input_messages,
+                    reasoning={"effort": REASONING_EFFORT},
+                    # Routes to a server that already holds the cached prefix.
+                    # Caching itself is automatic; this only avoids landing on a
+                    # cold server and paying full input price.
+                    prompt_cache_key="grokbot-chat",
                     # No web search for normal chat
                     temperature=0.8,
                 ),
@@ -176,7 +201,9 @@ async def on_message(message):
     # ── Log the interaction ───────────────────────────────────────────────────
     server_name  = message.guild.name if message.guild else "DM"
     channel_name = str(message.channel) if message.guild else "DM"
-    user_name    = f"{message.author.name}#{message.author.discriminator}"
+    # .discriminator is always "0" since Discord retired the #1234 system, so
+    # .name is the unique handle now.
+    user_name    = message.author.name
     # Flatten user_content to a plain string for logging
     if isinstance(user_content, list):
         logged_question = " | ".join(
@@ -215,12 +242,14 @@ async def ask_with_search(interaction: discord.Interaction, question: str):
     try:
         response_obj = await asyncio.wait_for(
             client.responses.create(
-                model="grok-4-1-fast-non-reasoning",
+                model=SEARCH_MODEL,
                 input=[
                     {"role": "system", "content": role_description + emoji_list},
                     {"role": "user", "content": question},
                 ],
                 tools=[{"type": "web_search"}],
+                reasoning={"effort": REASONING_EFFORT},
+                prompt_cache_key="grokbot-search",
                 temperature=0.8,
             ),
             timeout=timeout_seconds
@@ -243,7 +272,7 @@ async def ask_with_search(interaction: discord.Interaction, question: str):
     log_interaction(
         server=server_name,
         channel=str(interaction.channel),
-        user=f"{interaction.user.name}#{interaction.user.discriminator}",
+        user=interaction.user.name,
         question=f"[/ask] {question}",
         answer=response,
     )
@@ -264,7 +293,7 @@ async def generate_image(interaction: discord.Interaction, prompt: str):
     try:
         response = await asyncio.wait_for(
             client.images.generate(
-                model="grok-imagine-image",
+                model=IMAGE_MODEL,
                 prompt=prompt,
                 n=1,
             ),
@@ -279,7 +308,7 @@ async def generate_image(interaction: discord.Interaction, prompt: str):
             log_interaction(
                 server=server_name,
                 channel=str(interaction.channel),
-                user=f"{interaction.user.name}#{interaction.user.discriminator}",
+                user=interaction.user.name,
                 question=f"[/generate_image] {prompt}",
                 answer=f"[image URL returned: {image_url}]",
             )
