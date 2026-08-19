@@ -7,6 +7,8 @@ import traceback
 import discord
 import asyncio
 import os
+import httpx
+from typing import Optional
 from PIL import Image
 from datetime import datetime, timezone
 from discord.ext import commands
@@ -15,9 +17,13 @@ from openai import AsyncOpenAI
 
 
 # ── JSON logging setup ───────────────────────────────────────────────────────
-LOG_FILE = "logs/messages.jsonl"  # one JSON object per line
-ERROR_LOG_FILE = "logs/errors.jsonl"
-os.makedirs("logs", exist_ok=True)
+# One JSON object per line, in one file per day: logs/messages-2026-08-19.jsonl.
+# The date comes from the same timestamp that goes into the entry, so a message
+# handled across midnight cannot land in the wrong day's file. Dating the name
+# means rotation happens on its own, with no logrotate to configure and nothing
+# to coordinate with a process that holds the file open.
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 
 
 def log_interaction(
@@ -30,8 +36,9 @@ def log_interaction(
     output_items: list = None,
     raw_answer: str = None,
 ):
+    now = datetime.now(timezone.utc)
     entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now.isoformat(),
         "server": server,
         "channel": channel,
         "user": user,
@@ -43,23 +50,24 @@ def log_interaction(
         "question": question,
         "answer": answer,
     }
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
+    with open(f"{LOG_DIR}/messages-{now:%Y-%m-%d}.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def log_error(context: str, detail: str, extra: dict = None):
-    """Anything that went wrong, written to logs/errors.jsonl.
+    """Anything that went wrong, written to logs/errors-YYYY-MM-DD.jsonl.
 
     The console scrolls away and the user-facing reply is deliberately vague, so
     this is the only place the real xAI error text survives.
     """
+    now = datetime.now(timezone.utc)
     entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now.isoformat(),
         "context": context,
         "detail": detail,
         "extra": extra,
     }
-    with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+    with open(f"{LOG_DIR}/errors-{now:%Y-%m-%d}.jsonl", "a", encoding="utf-8") as f:
         # default=str so an unserialisable exception body still gets written.
         f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
     print(f"¤ERROR [{context}] {detail}")
@@ -122,9 +130,6 @@ timeout_seconds = 50
 image_timeout_seconds = 120
 
 # ── Model config ─────────────────────────────────────────────────────────────
-# grok-4-1-fast-non-reasoning was retired 2026-05-15. The old slug still
-# resolves, but it silently redirects to grok-4.3 and bills at grok-4.3 rates,
-# so name the model explicitly instead of relying on the redirect.
 # grok-4.3: 1M context, $1.25/1M input, $2.50/1M output.
 CHAT_MODEL = "grok-4.3"
 SEARCH_MODEL = "grok-4.3"
@@ -150,6 +155,27 @@ IMAGE_PRICE_USD = {
     ("grok-imagine-image", "2k", "medium"): 0.02,
 }
 
+# ── Video config ─────────────────────────────────────────────────────────────
+# Video is billed per second of output, by resolution: $0.08/s at 480p, $0.14/s
+# at 720p, $0.25/s at 1080p. Resolution and length are deliberately NOT command
+# options, so every /generate_video costs the same known amount. Exposed as
+# choices, one misclick on 1080p/15s would be $3.75, which is fifty times the
+# price of an image.
+VIDEO_MODEL = "grok-imagine-video-1.5"
+VIDEO_RESOLUTION = "480p"
+VIDEO_DURATION_SECONDS = 5
+VIDEO_PRICE_USD = 0.08 * VIDEO_DURATION_SECONDS
+# An attached image is billed as an image input on top of the video itself.
+VIDEO_IMAGE_INPUT_PRICE_USD = 0.01
+
+# There is no webhook and no streaming: the request returns an id immediately and
+# the only way to find out it finished is to keep asking. Generation runs for
+# minutes, not seconds. An interaction token dies after 15 minutes, so waiting
+# much past 10 would leave nothing to reply with.
+video_poll_interval_seconds = 3
+video_timeout_seconds = 600
+# ─────────────────────────────────────────────────────────────────────────────
+
 # "none" keeps the old fast non-reasoning behaviour. Verified against the API:
 # 0 reasoning tokens billed, ~1.3s replies. "low" burns ~95 reasoning tokens per
 # reply and is slower, so only switch if answers start feeling too dumb.
@@ -159,14 +185,23 @@ REASONING_EFFORT = "none"
 # replies always pay for some thinking. low is the cheapest it offers.
 IMAGE_REASONING_EFFORT = "low"
 
-# Safety net only, now that images go to a model that handles them. Each retry
+# Possible safety net only, now that images go to a model that handles them. Each retry
 # uses a different prompt_cache_key so a retry can land on a different server.
-IMAGE_TOOL_ATTEMPTS = 2
+IMAGE_TOOL_ATTEMPTS = 1
 # ─────────────────────────────────────────────────────────────────────────────
 
 client = AsyncOpenAI(
     api_key=GROK_KEY,
     base_url="https://api.x.ai/v1",
+)
+
+# Video lives on /v1/videos/generations, which the openai SDK has no binding for,
+# so that one endpoint is called by hand. Same key, same base url. httpx defaults
+# to a 5s timeout, which the upload of a base64 image would blow straight past.
+video_http = httpx.AsyncClient(
+    base_url="https://api.x.ai/v1",
+    headers={"Authorization": f"Bearer {GROK_KEY}"},
+    timeout=60.0,
 )
 
 intents = discord.Intents.default()
@@ -222,6 +257,7 @@ async def on_message(message):
         return
     if not bot.user in message.mentions:
         return
+
     if random.random() < 0.01:
         await message.reply("kill yourself")
         return
@@ -246,8 +282,7 @@ async def on_message(message):
 
     history = await get_conversation_history(message)
 
-    # Pillow reads webp and gif too, and everything is re-encoded as JPEG before
-    # it is sent, so those work now as well.
+    # Pillow reads webp and gif too, and everything is re-encoded as JPEG before it is sent
     image_attachments = [
         attachment for attachment in all_attachments
         if (attachment.content_type or "").startswith("image/")
@@ -261,13 +296,14 @@ async def on_message(message):
         except Exception as e:
             log_error("attachment convert", f"{image_attachments[0].filename}: {type(e).__name__}: {e}",
                       describe_exception(e))
-
+    
     if not image_attachments and all_attachments:
         role_description_extra += "\nThe user did provide an attachment, but it is not an image so you cannot look at it"
     if image_attachments and not image_data_url:
         role_description_extra += "\nThe user attached an image but it could not be read, so you cannot see it"
     if len(image_attachments) > 1:
         role_description_extra += "\nALWAYS note that the user sendt multiple attachemnts but you can only look at the first one"
+
     # Discord shows a preview for links but that preview is not an attachment, so
     # nothing behind a link ever reaches the model. Left unsaid it will invent a
     # description rather than admit it cannot look, because the prompt tells it to
@@ -640,6 +676,183 @@ async def generate_image(
             f"{interaction.user.mention} ❌ An error occurred: `{str(e)}`"
         )
 
+
+
+@bot.tree.command(
+    name="generate_video",
+    description=f"Grok generates a {VIDEO_DURATION_SECONDS} second video with sound. Costs ${VIDEO_PRICE_USD:.2f} every time",
+)
+@app_commands.describe(
+    prompt="Description of the video to generate",
+    image="Optional image to animate instead of starting from text alone (+$0.01)",
+    aspect_ratio="Shape of the video. Ignored when an image is attached",
+)
+@app_commands.choices(
+    aspect_ratio=[
+        app_commands.Choice(name=ratio, value=ratio)
+        for ratio in ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3"]
+    ],
+)
+async def generate_video(
+    interaction: discord.Interaction,
+    prompt: str,
+    image: Optional[discord.Attachment] = None,
+    aspect_ratio: str = "16:9",
+):
+    await interaction.response.defer()
+
+    cost = VIDEO_PRICE_USD + (VIDEO_IMAGE_INPUT_PRICE_USD if image else 0)
+    settings = f"{VIDEO_MODEL} · {VIDEO_DURATION_SECONDS}s · {VIDEO_RESOLUTION}"
+    if image:
+        settings += " · from image"
+    else:
+        settings += f" · {aspect_ratio}"
+    settings += f" · ${cost:.2f}"
+    header = f"**Prompt:** {prompt}\n-# {settings}"
+
+    image_url = None
+    if image:
+        is_image = (image.content_type or "").startswith("image/") \
+            or image.filename.lower().endswith(('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'))
+        if not is_image:
+            await interaction.followup.send(
+                f"{interaction.user.mention} ❌ `{image.filename}` is not an image, so there is nothing to animate."
+            )
+            return
+        try:
+            image_url = await attachment_to_data_url(image)
+        except Exception as e:
+            # Discord's own CDN link is publicly fetchable, so xAI can go get the
+            # original file itself when re-encoding it here fell over.
+            log_error("/generate_video", f"attachment convert {image.filename}: {type(e).__name__}: {e}",
+                      describe_exception(e))
+            image_url = image.url
+
+    video_url = None
+    video_file = None
+
+    try:
+        await interaction.edit_original_response(content=f"⏳ Generating video…\n{header}")
+
+        try:
+            request_id = await start_video_generation(prompt, image_url, aspect_ratio)
+        except Exception as e:
+            # Nothing has been generated yet at this point, so a retry is free.
+            # The docs say a base64 data uri is accepted, but if this key or model
+            # disagrees the CDN link is the other documented way in.
+            if image and image_url and image_url.startswith("data:"):
+                log_error("/generate_video", f"inline image rejected, retrying with the Discord link: {e}")
+                image_url = image.url
+                request_id = await start_video_generation(prompt, image_url, aspect_ratio)
+            else:
+                raise
+
+        print(f"¤/generate_video started {request_id}")
+        payload = await poll_video_generation(request_id)
+        video_url = (payload.get("video") or {}).get("url")
+        if not video_url:
+            raise RuntimeError("finished with no video url: " + json.dumps(redact_long_strings(payload))[:400])
+
+        # Those vidgen.x.ai links are signed and expire, so the file is uploaded
+        # to Discord whenever it fits and the link is only a fallback. The limit
+        # is 10 MiB on an unboosted server, and a 5 second 480p clip is normally
+        # well under that. A separate client because the request goes to a
+        # different host and the api key has no business being sent there.
+        upload_limit = interaction.guild.filesize_limit if interaction.guild else 10 * 1024 * 1024
+        try:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as download_http:
+                download = await download_http.get(video_url)
+            if download.status_code >= 400:
+                log_error("/generate_video", f"download returned {download.status_code}", {"url": video_url})
+            elif len(download.content) >= upload_limit:
+                log_error("/generate_video", f"too big to upload: {len(download.content)} bytes, limit {upload_limit}")
+            else:
+                video_file = discord.File(io.BytesIO(download.content), filename="grok_video.mp4")
+        except Exception as e:
+            log_error("/generate_video", f"download failed: {type(e).__name__}: {e}", describe_exception(e))
+
+        print(f"¤/generate_video done, uploaded={bool(video_file)} url={video_url}")
+
+        if video_file:
+            await interaction.followup.send(f"{interaction.user.mention} Here's your video!", file=video_file)
+        else:
+            await interaction.followup.send(f"{interaction.user.mention} Here's your video!\n{video_url}")
+
+    except asyncio.TimeoutError:
+        log_error("/generate_video", f"timed out after {video_timeout_seconds}s")
+        await interaction.followup.send(
+            f"{interaction.user.mention} ⏱️ Video generation timed out after {video_timeout_seconds // 60} minutes."
+            " It may still finish on xAI's side, but nothing came back in time."
+        )
+    except Exception as e:
+        log_error("/generate_video", f"{type(e).__name__}: {str(e)}", describe_exception(e))
+        await interaction.followup.send(
+            f"{interaction.user.mention} ❌ An error occurred: `{str(e)[:300]}`"
+        )
+    finally:
+        # Drops the ⏳ whichever way this went, so a failed run does not sit there
+        # claiming to still be working.
+        try:
+            await interaction.edit_original_response(content=header)
+        except Exception as e:
+            log_error("/generate_video", f"could not clear the progress message: {type(e).__name__}: {e}")
+
+        server_name = interaction.guild.name if interaction.guild else "DM"
+        log_interaction(
+            server=server_name,
+            channel=str(interaction.channel),
+            user=interaction.user.name,
+            question=f"[/generate_video] {prompt} ({VIDEO_MODEL}, {aspect_ratio}, {VIDEO_RESOLUTION}, {VIDEO_DURATION_SECONDS}s)",
+            answer=f"[${cost:.2f}, {'uploaded' if video_file else 'link only'}]: {video_url or 'no video'}",
+            image_attached=bool(image),
+        )
+
+
+
+async def start_video_generation(prompt: str, image_url: str, aspect_ratio: str) -> str:
+    """Queue a video job and return its id. Nothing is generated yet at this point."""
+    body = {
+        "model": VIDEO_MODEL,
+        "prompt": prompt,
+        "duration": VIDEO_DURATION_SECONDS,
+        "resolution": VIDEO_RESOLUTION,
+    }
+    if image_url:
+        # aspect_ratio is not documented for image-to-video and the source image
+        # already decides the shape, so it is only sent for text-to-video.
+        body["image"] = {"url": image_url}
+    else:
+        body["aspect_ratio"] = aspect_ratio
+
+    response = await video_http.post("/videos/generations", json=body)
+    if response.status_code >= 400:
+        # raise_for_status throws away the body, and the body is the only place
+        # xAI says what was actually wrong with the request.
+        raise RuntimeError(f"start {response.status_code}: {response.text[:400]}")
+    return response.json()["request_id"]
+
+
+async def poll_video_generation(request_id: str) -> dict:
+    """Keep asking until the job is done, then hand back the finished payload."""
+    deadline = asyncio.get_running_loop().time() + video_timeout_seconds
+    while True:
+        response = await video_http.get(f"/videos/{request_id}")
+        if response.status_code >= 400:
+            raise RuntimeError(f"poll {response.status_code}: {response.text[:400]}")
+
+        payload = response.json()
+        status = payload.get("status")
+        if status == "done":
+            return payload
+        if status in ("failed", "expired"):
+            # A moderation block arrives here as invalid_argument, not as an HTTP
+            # error, so this is where a refused prompt surfaces.
+            error = payload.get("error") or {}
+            raise RuntimeError(f"{status}: {error.get('code')} - {error.get('message')}")
+
+        if asyncio.get_running_loop().time() >= deadline:
+            raise asyncio.TimeoutError()
+        await asyncio.sleep(video_poll_interval_seconds)
 
 
 async def create_chat_response(input_messages: list, tools: list, model: str, effort: str, cache_key: str):
