@@ -124,6 +124,9 @@ with open('keys.json', 'r') as file:
 DISCORD_TOKEN = secrets["discord_bot_token"]
 GROK_KEY = secrets["grok_key"]
 
+# Billing lives behind a different key on a different host.
+MANAGEMENT_KEY = secrets.get("xai_management_key", "")
+
 timeout_seconds = 50
 # Image generation is slower than chat. A single 2k image measured ~16s, so this
 # is generous on purpose.
@@ -134,7 +137,7 @@ image_timeout_seconds = 120
 CHAT_MODEL = "grok-4.3"
 SEARCH_MODEL = "grok-4.3"
 
-# grok-4.3 returns 500 "Internal error during token parsing" on every request
+# grok-4.3 returned 500 "Internal error during token parsing" on every request
 # that carries both an input image and the image_generation tool. Measured 0/4
 # on 4.3 against 4/4 on 4.6 with the same image, so it is the model, not the
 # image and not bad luck. 4.6 costs $2/$6 per 1M against 4.3's $1.25/$2.50, so
@@ -217,6 +220,20 @@ video_http = httpx.AsyncClient(
     headers={"Authorization": f"Bearer {GROK_KEY}"},
     timeout=60.0,
 )
+
+# The management API is a separate host from the inference API, and no /v1 in the
+# base url because the two documented path families disagree about whether they
+# carry that prefix.
+management_http = httpx.AsyncClient(
+    base_url="https://management-api.x.ai",
+    headers={"Authorization": f"Bearer {MANAGEMENT_KEY}"},
+    timeout=20.0,
+)
+
+# Learned on the first /balance and kept for the life of the process. Every
+# billing path is scoped to a team id, and asking the key what it belongs to is
+# the only way to find out what that id is.
+management_team_id = ""
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -899,6 +916,62 @@ async def generate_video(
             answer=f"[${cost:.2f}, {'uploaded' if video_file else 'link only'}]: {video_url or 'no video'}",
             image_attached=bool(image),
         )
+
+
+
+@bot.tree.command(name="balance", description="How much money is left in the Grok API account, might take some minutes to update after spending")
+async def show_balance(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    global management_team_id
+
+    if not MANAGEMENT_KEY:
+        await interaction.followup.send(
+            "⚠️ - No management key configured"
+        )
+        return
+
+    try:
+        if not management_team_id:
+            # This endpoint needs no ACL of its own, so it still answers for a
+            # key restricted to billing reads. The docs write the billing paths
+            # with a /v1 prefix and the auth paths without one, and never show a
+            # full url for this one, so both spellings get a try. One wasted
+            # request beats guessing wrong and having the command never work.
+            for validation_path in ("/auth/management-keys/validation", "/v1/auth/management-keys/validation"):
+                validation_response = await management_http.get(validation_path)
+                if validation_response.status_code < 400:
+                    management_team_id = validation_response.json()["teamId"]
+                    break
+            if not management_team_id:
+                raise RuntimeError(f"validation {validation_response.status_code}: {validation_response.text[:400]}")
+
+        # The obvious endpoint for this, /prepaid/balance, is a trap: its total is
+        # the credit you had at the START of the billing cycle. Usage only lands
+        # in it as a SPEND row when the month is invoiced, around the 11th of the
+        # next one, so mid-month it reads high - it said $32.03 against a real
+        # $15.75. The invoice preview carries that same number plus what this
+        # cycle has eaten so far, and the two together are what the console shows.
+        preview_response = await management_http.get(f"/v1/billing/teams/{management_team_id}/postpaid/invoice/preview")
+        if preview_response.status_code >= 400:
+            raise RuntimeError(f"preview {preview_response.status_code}: {preview_response.text[:400]}")
+
+        # Both are cents, as strings, and credit is booked negative: -3203 means
+        # $32.03 sitting in the account, -1628 means $16.28 of it already spent.
+        # So the money left is used minus credit, which comes out positive.
+        core_invoice = preview_response.json()["coreInvoice"]
+        credit_at_cycle_start_cents = int(core_invoice["prepaidCredits"]["val"])
+        used_this_cycle_cents = int(core_invoice["prepaidCreditsUsed"]["val"])
+        credits_left_usd = (used_this_cycle_cents - credit_at_cycle_start_cents) / 100
+
+        reply = f"Credit balance: **${credits_left_usd:.2f}**"
+
+    except Exception as e:
+        log_error("/balance", f"{type(e).__name__}: {str(e)}", describe_exception(e))
+        reply = "⚠️ - Could not read the balance: " + str(e)[:300]
+
+    print(f"¤/balance Final Message: {reply}")
+    await interaction.followup.send(reply)
 
 
 
