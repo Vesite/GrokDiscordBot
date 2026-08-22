@@ -193,6 +193,20 @@ IMAGE_TOOL_ATTEMPTS = 1
 client = AsyncOpenAI(
     api_key=GROK_KEY,
     base_url="https://api.x.ai/v1",
+    # The SDK defaults to max_retries=2, so one call is really up to three
+    # attempts with 0.5-8s of backoff between them, and it swallows the 429s,
+    # 500s and connection errors that caused them. All of that happens inside
+    # the asyncio.wait_for at the call site, so a retry storm and a single hung
+    # request both come out as the same "timed out after 50s" line with nothing
+    # saying which. It also means the 500-with-image+tool retry further down
+    # only runs if the SDK's own retries finish before the wait_for kills the
+    # request, which is likely why that handler has logged 2 events ever.
+    # 0 makes every failure surface immediately with its real status code.
+    max_retries=0,
+    # Timeout is deliberately left at the SDK default. Every call site already
+    # wraps its request in a wait_for with the right budget for that path, and
+    # /generate_image legitimately needs 120s, so a client-wide timeout would
+    # cap that one at whatever the shortest path uses.
 )
 
 # Video lives on /v1/videos/generations, which the openai SDK has no binding for,
