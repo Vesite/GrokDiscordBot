@@ -11,10 +11,10 @@ import os
 import httpx
 from typing import Optional
 from PIL import Image
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from discord.ext import commands
 from discord import app_commands
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, omit
 
 
 # ── JSON logging setup ───────────────────────────────────────────────────────
@@ -224,6 +224,41 @@ MAX_INPUT_IMAGES = 5
 # Possible safety net only, now that images go to a model that handles them. Each retry
 # uses a different prompt_cache_key so a retry can land on a different server.
 IMAGE_TOOL_ATTEMPTS = 1
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Reading recent channel messages ──────────────────────────────────────────
+# Used by the read_recent_messages tool (Grok decides when) and by /summarize.
+# Only ever the channel the request came from. At the limits, 2500 messages is
+# roughly 60-125k tokens, about $0.08-0.16 on grok-4.3. Most reads are far smaller.
+RECENT_MESSAGES_MAX_HOURS = 168
+RECENT_MESSAGES_MAX_COUNT = 2500
+# One long paste should not eat the whole budget.
+RECENT_MESSAGE_MAX_CHARS = 300
+# A big read means a big prompt, which takes longer than a normal reply.
+summary_timeout_seconds = 90
+
+READ_RECENT_MESSAGES_TOOL = {
+    "type": "function",
+    "name": "read_recent_messages",
+    "description": (
+        "Read the messages people posted in this Discord channel during the last few hours,"
+        " oldest first, each with how long ago it was sent and who sent it. Use it whenever"
+        " answering needs what was said earlier in the channel and it is not already in the"
+        " conversation you were given: summarising, 'what did I miss', catching someone up,"
+        " who said what, what people were talking about or arguing about. Do not use it for"
+        f" anything else. At most {RECENT_MESSAGES_MAX_HOURS} hours."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "hours": {
+                "type": "number",
+                "description": "How many hours back to read. Use what the question implies, or 24 if it says nothing.",
+            },
+        },
+        "required": ["hours"],
+    },
+}
 # ─────────────────────────────────────────────────────────────────────────────
 
 client = AsyncOpenAI(
@@ -477,6 +512,8 @@ async def on_message(message):
     else:
         chat_model, chat_effort, base_cache_key, chat_timeout = (
             CHAT_MODEL, REASONING_EFFORT, "grokbot-chat", timeout_seconds)
+    # Grok picks between these itself: draw something, or read the channel first.
+    chat_tools = [{"type": "image_generation"}, READ_RECENT_MESSAGES_TOOL]
 
     generated_images = []
     output_items = []
@@ -508,7 +545,7 @@ async def on_message(message):
                 cache_key = base_cache_key if attempt == 0 else f"{base_cache_key}-r{random.randint(1, 999999)}"
                 try:
                     response_obj = await create_chat_response(
-                        input_messages, [{"type": "image_generation"}],
+                        input_messages, chat_tools,
                         chat_model, chat_effort, cache_key, chat_timeout, calls)
                     break
                 except Exception as e:
@@ -531,7 +568,7 @@ async def on_message(message):
                 chat_model, chat_effort, base_cache_key, chat_timeout = (
                     IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT, "grokbot-image", image_chat_timeout_seconds)
                 response_obj = await create_chat_response(
-                    input_messages, [{"type": "image_generation"}],
+                    input_messages, chat_tools,
                     chat_model, chat_effort, base_cache_key, chat_timeout, calls)
 
             if response_obj is None:
@@ -540,6 +577,47 @@ async def on_message(message):
                 log_error("on_message", "image+tool failed every attempt, dropping the tool")
                 response_obj = await create_chat_response(
                     input_messages, [], chat_model, chat_effort, base_cache_key, chat_timeout, calls)
+
+            # ── Read the channel when Grok asks for it ──────────────────────
+            # Instead of answering, Grok can return a function_call for
+            # read_recent_messages. The messages are fetched here and handed back
+            # in a follow-up request that continues the stored response. A few
+            # rounds in case it wants a longer window after seeing the first one.
+            for _ in range(3):
+                function_calls = [item for item in response_obj.model_dump().get("output", [])
+                                  if item.get("type") == "function_call"]
+                if not function_calls:
+                    break
+                function_outputs = []
+                for function_call in function_calls:
+                    if function_call.get("name") != "read_recent_messages":
+                        function_output = f"There is no function called {function_call.get('name')}."
+                    else:
+                        try:
+                            hours = float(json.loads(function_call.get("arguments") or "{}").get("hours", 24))
+                        except (ValueError, TypeError, AttributeError):
+                            hours = 24
+                        hours = min(max(hours, 0.1), RECENT_MESSAGES_MAX_HOURS)
+                        fetch_started = time.monotonic()
+                        try:
+                            function_output, message_count = await read_recent_messages(message.channel, hours, message)
+                            fetch_outcome = f"{message_count} messages, {hours:g}h"
+                        except discord.Forbidden:
+                            function_output = "The bot is not allowed to read this channel's message history."
+                            fetch_outcome = "Forbidden"
+                        calls.append({"call": "read_recent_messages",
+                                      "seconds": round(time.monotonic() - fetch_started, 2),
+                                      "outcome": fetch_outcome})
+                    function_outputs.append({
+                        "type": "function_call_output",
+                        "call_id": function_call.get("call_id"),
+                        "output": function_output,
+                    })
+                # Answering over a big pile of messages takes longer than a normal reply.
+                chat_timeout = max(chat_timeout, summary_timeout_seconds)
+                response_obj = await create_chat_response(
+                    function_outputs, chat_tools, chat_model, chat_effort, base_cache_key,
+                    chat_timeout, calls, previous_response_id=response_obj.id)
 
             full_response = response_obj.model_dump()
             output_items = full_response.get("output", [])
@@ -819,6 +897,92 @@ async def ask_with_search(interaction: discord.Interaction, question: str):
     )
 
     reply = f"**Q: {question}**\n\n{response}"
+    if len(reply) > 1900:
+        await interaction.followup.send(reply[:1900] + "... (message limit reached)")
+    else:
+        await interaction.followup.send(reply)
+
+
+
+@bot.tree.command(name="summarize", description="Summarise what was said in this channel recently")
+@app_commands.describe(hours=f"How many hours back to read, 1-{RECENT_MESSAGES_MAX_HOURS}")
+async def summarize(interaction: discord.Interaction,
+                    hours: app_commands.Range[int, 1, RECENT_MESSAGES_MAX_HOURS] = 24):
+    await interaction.response.defer()
+
+    started = time.monotonic()
+    calls = []
+    message_count = 0
+    try:
+        fetch_started = time.monotonic()
+        recent_messages, message_count = await read_recent_messages(interaction.channel, hours, None)
+        calls.append({"call": "read_recent_messages", "seconds": round(time.monotonic() - fetch_started, 2),
+                      "outcome": f"{message_count} messages, {hours}h"})
+
+        if message_count == 0:
+            response = f"No messages in this channel in the last {hours}h."
+        else:
+            input_messages = [
+                {"role": "system", "content": role_description + emoji_list},
+                {"role": "system", "content": (
+                    "Summarise the channel messages below for someone who missed them. Cover the"
+                    " main topics, who said what when it matters, and anything decided or left"
+                    " open. Use people's names. Keep it short enough to read in a minute.")},
+                {"role": "user", "content": recent_messages},
+            ]
+            # Same fallback as on_message: a 5xx or "at capacity" on 4.3 gets one go on 4.6.
+            summary_model = CHAT_MODEL
+            try:
+                response_obj = await create_chat_response(
+                    input_messages, [], CHAT_MODEL, REASONING_EFFORT, "grokbot-summary",
+                    summary_timeout_seconds, calls)
+            except Exception as e:
+                status_code = getattr(e, "status_code", None)
+                is_at_capacity = status_code == 429 and "capacity" in str(getattr(e, "body", None) or e)
+                if not ((status_code or 0) >= 500 or is_at_capacity):
+                    raise
+                log_error("/summarize fallback", f"{CHAT_MODEL} {type(e).__name__}: {e}", describe_exception(e))
+                summary_model = IMAGE_CHAT_MODEL
+                response_obj = await create_chat_response(
+                    input_messages, [], IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT, "grokbot-summary",
+                    summary_timeout_seconds, calls)
+            response = response_obj.output_text or "⚠️ - No response generated"
+            print(f"¤/summarize answered by {summary_model}")
+
+    except discord.Forbidden:
+        response = "⚠️ - I'm not allowed to read this channel's message history."
+        log_error("/summarize", "Forbidden reading channel history", {"calls": calls})
+    except asyncio.TimeoutError:
+        response = "⚠️ - Request timed out"
+        log_error("/summarize", f"timed out after {summary_timeout_seconds}s", {"calls": calls})
+    except Exception as e:
+        log_error("/summarize", f"{type(e).__name__}: {str(e)}", {**describe_exception(e), "calls": calls})
+        status_code = getattr(e, "status_code", None)
+        rate_limit_reason = str(getattr(e, "body", None) or e)
+        if status_code == 429 and "capacity" in rate_limit_reason:
+            response = "⚠️ - xAI's servers are overloaded right now, not a bot problem. Try again in a few minutes"
+        elif status_code == 429 and "credits" in rate_limit_reason:
+            response = "⚠️ - Out of xAI credits or the monthly spending limit is reached"
+        elif (status_code or 0) >= 500:
+            response = f"⚠️ - xAI had an internal error ({status_code}), not a bot problem. Try again"
+        else:
+            response = "⚠️ - An unexpected error occurred, code: " + str(status_code)
+
+    seconds = round(time.monotonic() - started, 2)
+    print(f"¤/summarize took {seconds}s, calls: {calls}")
+
+    server_name = interaction.guild.name if interaction.guild else "DM"
+    log_interaction(
+        server=server_name,
+        channel=str(interaction.channel),
+        user=interaction.user.name,
+        question=f"[/summarize] {hours}h",
+        answer=response,
+        seconds=seconds,
+        calls=calls,
+    )
+
+    reply = f"**Summary of the last {hours}h** ({message_count} messages)\n\n{response}"
     if len(reply) > 1900:
         await interaction.followup.send(reply[:1900] + "... (message limit reached)")
     else:
@@ -1216,9 +1380,56 @@ async def poll_video_generation(request_id: str) -> dict:
         await asyncio.sleep(video_poll_interval_seconds)
 
 
+async def read_recent_messages(channel, hours: float, before) -> tuple[str, int]:
+    """The channel's messages from the last hours as text for the model, and how many there were.
+
+    Oldest first, one per line: "[2h05m ago] name: text". Ages instead of clock
+    times, so no timezone has to be guessed. before excludes the asking message.
+    """
+    now = discord.utils.utcnow()
+    lines = []
+    # Newest first, so hitting the count limit drops the oldest messages rather
+    # than the newest. Reversed at the end.
+    async for past_message in channel.history(limit=RECENT_MESSAGES_MAX_COUNT, before=before,
+                                              after=now - timedelta(hours=hours), oldest_first=False):
+        # clean_content turns <@123> mentions into readable @names.
+        text = past_message.clean_content.strip()
+        if len(text) > RECENT_MESSAGE_MAX_CHARS:
+            text = text[:RECENT_MESSAGE_MAX_CHARS] + " ...(cut)"
+        for attachment in past_message.attachments:
+            if (attachment.content_type or "").startswith("image/"):
+                text += " [image]"
+            else:
+                text += f" [file: {attachment.filename}]"
+        if not text:
+            continue
+
+        minutes_ago = int((now - past_message.created_at).total_seconds() // 60)
+        if minutes_ago >= 24 * 60:
+            age = f"{minutes_ago // (24 * 60)}d{minutes_ago % (24 * 60) // 60}h ago"
+        elif minutes_ago >= 60:
+            age = f"{minutes_ago // 60}h{minutes_ago % 60:02d}m ago"
+        else:
+            age = f"{minutes_ago}m ago"
+        author = "you (the bot)" if past_message.author == bot.user else past_message.author.display_name
+        lines.append(f"[{age}] {author}: {text}")
+    lines.reverse()
+
+    if not lines:
+        return f"There were no messages in this channel in the last {hours:g} hours.", 0
+    header = f"{len(lines)} messages from the last {hours:g} hours in this channel, oldest first"
+    if len(lines) >= RECENT_MESSAGES_MAX_COUNT:
+        header += f" (only the newest {RECENT_MESSAGES_MAX_COUNT}, older ones in that window were not read)"
+    return header + ":\n" + "\n".join(lines), len(lines)
+
+
 async def create_chat_response(input_messages: list, tools: list, model: str, effort: str, cache_key: str, timeout: float,
-                               calls: list):
-    """One chat request. Appends {"call", "seconds", "outcome"} to calls whether it works or not."""
+                               calls: list, previous_response_id: str = None):
+    """One chat request. Appends {"call", "seconds", "outcome"} to calls whether it works or not.
+
+    previous_response_id continues a stored response (xAI keeps them 30 days),
+    so input_messages only has to hold what is new, like a function call's result.
+    """
     started = time.monotonic()
     outcome = "ok"
     try:
@@ -1237,6 +1448,8 @@ async def create_chat_response(input_messages: list, tools: list, model: str, ef
                 # No web search for normal chat
                 tools=tools,
                 temperature=0.8,
+                # omit leaves the field out entirely rather than sending null.
+                previous_response_id=previous_response_id or omit,
             ),
             timeout=timeout
         )
