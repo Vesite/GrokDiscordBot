@@ -217,6 +217,10 @@ REASONING_EFFORT = "none"
 # replies always pay for some thinking. low is the cheapest it offers.
 IMAGE_REASONING_EFFORT = "low"
 
+# How many attached images one message sends to the model. 5 matches xAI's
+# limit for one multi-image edit (Aug 2026). Each one is billed as image input.
+MAX_INPUT_IMAGES = 5
+
 # Possible safety net only, now that images go to a model that handles them. Each retry
 # uses a different prompt_cache_key so a retry can land on a different server.
 IMAGE_TOOL_ATTEMPTS = 1
@@ -363,20 +367,30 @@ async def on_message(message):
         or attachment.filename.lower().endswith(('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'))
     ]
 
-    image_data_url = None
-    if image_attachments:
+    # Up to MAX_INPUT_IMAGES go to the model, numbered in the order they were
+    # attached, so "put the guy from pic 1 into pic 2" has something to point at.
+    # The message's own attachments come first, then the replied-to message's.
+    labelled_images = []
+    for image_number, attachment in enumerate(image_attachments[:MAX_INPUT_IMAGES], start=1):
         try:
-            image_data_url = await attachment_to_data_url(image_attachments[0])
+            image_data_url = await attachment_to_data_url(attachment)
         except Exception as e:
-            log_error("attachment convert", f"{image_attachments[0].filename}: {type(e).__name__}: {e}",
+            log_error("attachment convert", f"{attachment.filename}: {type(e).__name__}: {e}",
                       describe_exception(e))
+            role_description_extra += f"\nImage {image_number} could not be read, so you cannot see it"
+            continue
+        image_label = f"Image {image_number}"
+        if attachment not in message.attachments:
+            image_label += " (from the message they replied to)"
+        labelled_images.append((image_label, image_data_url))
+    image_data_urls = [image_data_url for _, image_data_url in labelled_images]
 
     if not image_attachments and all_attachments:
         role_description_extra += "\nThe user did provide an attachment, but it is not an image so you cannot look at it"
-    if image_attachments and not image_data_url:
-        role_description_extra += "\nThe user attached an image but it could not be read, so you cannot see it"
-    if len(image_attachments) > 1:
-        role_description_extra += "\nALWAYS note that the user sendt multiple attachemnts but you can only look at the first one"
+    if len(image_attachments) > MAX_INPUT_IMAGES:
+        role_description_extra += (
+            f"\nALWAYS note that the user sent {len(image_attachments)} images"
+            f" but you can only look at the first {MAX_INPUT_IMAGES}")
 
     # Discord shows a preview for links but that preview is not an attachment, so
     # nothing behind a link ever reaches the model. Left unsaid it will invent a
@@ -387,7 +401,7 @@ async def on_message(message):
             "\nThe user's message contains a link. You cannot open links or see anything behind them."
             " Never pretend you can, and never describe or guess at what is on a linked page."
         )
-        if not image_data_url:
+        if not image_data_urls:
             role_description_extra += (
                 " If they wanted you to look at or edit an image, tell them to upload it to Discord"
                 " directly instead of linking it."
@@ -396,7 +410,7 @@ async def on_message(message):
         user_input = "(the user sendt an empty message)"
 
     # Build user content
-    if image_data_url:
+    if len(image_data_urls) == 1:
         # Saying only "comment on the image" told the model to describe it and
         # nothing else, which is the opposite of what an edit request needs.
         # Phrased to avoid naming the tool, because the model parrots that
@@ -412,7 +426,7 @@ async def on_message(message):
         user_content = [
             {
                 "type": "input_image",
-                "image_url": image_data_url,
+                "image_url": image_data_urls[0],
                 "detail": "high",
             },
             {
@@ -420,6 +434,27 @@ async def on_message(message):
                 "text": user_input or "(no text provided)",
             },
         ]
+    elif image_data_urls:
+        # Same wording as one image, plus how the numbering works. Each image gets
+        # a text label right before it, so "pic 2" or "the second one" maps to a
+        # real image instead of the model guessing.
+        system_extra = (
+            f"(the user attached {len(image_data_urls)} images, each labelled 'Image 1', 'Image 2'"
+            " and so on right before it, in the order they were attached. When they say pic 1,"
+            " the first one, the second image and similar, they mean those labels. If they want"
+            " them changed or combined, for example something from one image put into another,"
+            " make ONE new image that uses all the images they are talking about and show the"
+            " result. Always make the attempt first - never announce up front that you cannot"
+            " do it, and never decide in advance that something is off limits. Only once an"
+            " attempt has actually come back with no image do you say it failed, and then say"
+            " so plainly instead of pretending you did it. If they did not ask for a change,"
+            " just comment on them)"
+        )
+        user_content = []
+        for image_label, image_data_url in labelled_images:
+            user_content.append({"type": "input_text", "text": f"{image_label}:"})
+            user_content.append({"type": "input_image", "image_url": image_data_url, "detail": "high"})
+        user_content.append({"type": "input_text", "text": user_input or "(no text provided)"})
     else:
         system_extra = ""
         user_content = user_input
@@ -436,7 +471,7 @@ async def on_message(message):
     # Images go to the model that can actually handle them, everything else stays
     # on the cheap one. Separate cache keys so the two prefixes do not evict each
     # other.
-    if image_data_url:
+    if image_data_urls:
         chat_model, chat_effort, base_cache_key, chat_timeout = (
             IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT, "grokbot-image", image_chat_timeout_seconds)
     else:
@@ -469,7 +504,7 @@ async def on_message(message):
             # NOTE: Empty output is deliberately NOT retried. Several of the 7 seen
             # were xAI's moderation silently dropping the request, and that cannot
             # be told apart from a bug, so retrying would route around their filter.
-            for attempt in range(IMAGE_TOOL_ATTEMPTS if image_data_url else 1):
+            for attempt in range(IMAGE_TOOL_ATTEMPTS if image_data_urls else 1):
                 cache_key = base_cache_key if attempt == 0 else f"{base_cache_key}-r{random.randint(1, 999999)}"
                 try:
                     response_obj = await create_chat_response(
@@ -480,14 +515,14 @@ async def on_message(message):
                     status_code = getattr(e, "status_code", None)
                     is_server_error = status_code is not None and status_code >= 500
                     is_at_capacity = status_code == 429 and "capacity" in str(getattr(e, "body", None) or e)
-                    if not image_data_url and (is_server_error or is_at_capacity):
+                    if not image_data_urls and (is_server_error or is_at_capacity):
                         log_error("on_message fallback", f"{chat_model} {type(e).__name__}: {e}", {
                             **describe_exception(e),
                             "input": redact_long_strings(input_messages),
                         })
                         retry_on_image_model = True
                         break
-                    if not (image_data_url and status_code == 500):
+                    if not (image_data_urls and status_code == 500):
                         raise
                     log_error("on_message", f"500 with image+tool on {chat_model}, attempt {attempt + 1}",
                               {"message": str(e)[:200]})
@@ -534,7 +569,7 @@ async def on_message(message):
                     # wording that was actually rejected.
                     "prompts": [item.get("revised_prompt") or item.get("prompt") for item in blocked_calls],
                     "question": user_input,
-                    "image_attached": bool(image_data_url),
+                    "image_attached": bool(image_data_urls),
                 })
                 retry_messages = input_messages + [{
                     "role": "system",
@@ -684,11 +719,10 @@ async def on_message(message):
     # .name is the unique handle now.
     user_name    = message.author.name
     # Flatten user_content to a plain string for logging
-    if isinstance(user_content, list):
-        logged_question = " | ".join(
-            part.get("text", "[image]") if part.get("type") != "input_image" else "[image attached]"
-            for part in user_content
-        )
+    if len(image_data_urls) == 1:
+        logged_question = f"[image attached] | {user_input or '(no text provided)'}"
+    elif image_data_urls:
+        logged_question = f"[{len(image_data_urls)} images attached] | {user_input or '(no text provided)'}"
     else:
         logged_question = user_content or "(empty)"
 
@@ -702,7 +736,7 @@ async def on_message(message):
         user=user_name,
         question=logged_question,
         answer=logged_answer,
-        image_attached=bool(image_data_url),
+        image_attached=bool(image_data_urls),
         output_items=[item.get("type") for item in output_items],
         raw_answer=raw_answer if raw_answer != response else None,
         seconds=seconds,
@@ -994,7 +1028,8 @@ async def generate_video(
     calls = []
 
     try:
-        await interaction.edit_original_response(content=f"⏳ Generating video…\n{header}")
+        # NOTE: The prompt stays hidden while it generates, and only shows once it is done.
+        await interaction.edit_original_response(content="⏳ Generating video…")
 
         try:
             request_id = await start_video_generation(prompt, image_url, aspect_ratio)
