@@ -3,6 +3,7 @@ import random
 import base64
 import io
 import re
+import time
 import traceback
 import discord
 import asyncio
@@ -35,6 +36,8 @@ def log_interaction(
     image_attached: bool = False,
     output_items: list = None,
     raw_answer: str = None,
+    seconds: float = None,
+    calls: list = None,
 ):
     now = datetime.now(timezone.utc)
     entry = {
@@ -43,6 +46,10 @@ def log_interaction(
         "channel": channel,
         "user": user,
         "image_attached": image_attached,
+        # Wall time for the whole request, and each outgoing call inside it as
+        # {"call", "seconds", "outcome"}, so slow or retried requests show up.
+        "seconds": seconds,
+        "calls": calls,
         # What the API actually returned, so a weird reply can be diagnosed after
         # the fact instead of only while it is still on screen.
         "output_items": output_items,
@@ -95,13 +102,31 @@ async def attachment_to_data_url(attachment) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
 
 
+def image_file_extension(image_bytes: bytes) -> str:
+    """Discord needs the file extension to match the real bytes or the attachment
+    will not preview or download properly. The docs say JPEG but PNG comes back
+    too, so check the header instead of trusting either."""
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if image_bytes.startswith(b"GIF8"):
+        return "gif"
+    if image_bytes[8:12] == b"WEBP":
+        return "webp"
+    return "jpg"
+
+
 def redact_long_strings(value):
-    """Swap base64 image payloads for their size so a dumped response stays readable."""
+    """Swap base64 image payloads for their size so a dumped response stays readable.
+
+    NOTE: The cutoff sits far above any real text. History turns are cut at 2000
+    chars and replies at 1900, while one attached image is 100k+ chars of base64.
+    At the old cutoff of 500 the reply-chain history would have been hidden too.
+    """
     if isinstance(value, dict):
         return {key: redact_long_strings(item) for key, item in value.items()}
     if isinstance(value, list):
         return [redact_long_strings(item) for item in value]
-    if isinstance(value, str) and len(value) > 500:
+    if isinstance(value, str) and len(value) > 10000:
         return f"<{len(value)} chars omitted>"
     return value
 
@@ -128,6 +153,10 @@ GROK_KEY = secrets["grok_key"]
 MANAGEMENT_KEY = secrets.get("xai_management_key", "")
 
 timeout_seconds = 50
+# grok-4.6 always reasons and usually has a high-detail image to look at. 11 of
+# the 12 chat timeouts from Aug-Oct 2026 were on that path at 50s, including
+# plain questions like "explain like im five" with no image generated at all.
+image_chat_timeout_seconds = 90
 # Image generation is slower than chat. A single 2k image measured ~16s, so this
 # is generous on purpose.
 image_timeout_seconds = 120
@@ -293,9 +322,19 @@ async def on_message(message):
     if not bot.user in message.mentions:
         return
 
-    if random.random() < 0.01:
+    # One roll so each canned reply is exactly 1%.
+    canned_reply_roll = random.random()
+    if canned_reply_roll < 0.01:
         await message.reply("kill yourself")
         return
+    if canned_reply_roll < 0.02:
+        await message.reply("Can you please shut the fuck up with these retarded questions and get a job, I'm tired of all your bullshit")
+        return
+
+    # Covers everything up to the reply: fetching history, converting the image,
+    # every xAI call and retry.
+    started = time.monotonic()
+    calls = []
 
     user_input = message.content.replace(f'<@{bot.user.id}>', '').strip()
     role_description_extra = ""
@@ -398,13 +437,17 @@ async def on_message(message):
     # on the cheap one. Separate cache keys so the two prefixes do not evict each
     # other.
     if image_data_url:
-        chat_model, chat_effort, base_cache_key = IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT, "grokbot-image"
+        chat_model, chat_effort, base_cache_key, chat_timeout = (
+            IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT, "grokbot-image", image_chat_timeout_seconds)
     else:
-        chat_model, chat_effort, base_cache_key = CHAT_MODEL, REASONING_EFFORT, "grokbot-chat"
+        chat_model, chat_effort, base_cache_key, chat_timeout = (
+            CHAT_MODEL, REASONING_EFFORT, "grokbot-chat", timeout_seconds)
 
     generated_images = []
     output_items = []
     raw_answer = None
+    # Set before the try so the error message can say whether both models were tried.
+    retry_on_image_model = False
 
     async with message.channel.typing():
         try:
@@ -415,25 +458,53 @@ async def on_message(message):
             # having the broken path, and prompt_cache_key is what pins a request
             # to a server, so each retry uses a fresh key to land somewhere else.
             response_obj = None
+            # grok-4.3 also breaks when it tries to MAKE an image with no image
+            # attached. Aug-Oct 2026 on the text path: 28 images made, against 18
+            # "500 token parsing", 7 completed-but-empty outputs and 9 "500 token
+            # generation" (brainfuck, wingdings and similar). grok-4.6 had none of
+            # these in ~330 requests. So any 5xx from 4.3 gets one more go on 4.6.
+            # So does a 429 "at capacity", since capacity is per model. A 429 for
+            # being out of credits is not retried, the other model would refuse too.
+            # That only costs extra on requests that already failed.
+            # NOTE: Empty output is deliberately NOT retried. Several of the 7 seen
+            # were xAI's moderation silently dropping the request, and that cannot
+            # be told apart from a bug, so retrying would route around their filter.
             for attempt in range(IMAGE_TOOL_ATTEMPTS if image_data_url else 1):
                 cache_key = base_cache_key if attempt == 0 else f"{base_cache_key}-r{random.randint(1, 999999)}"
                 try:
                     response_obj = await create_chat_response(
                         input_messages, [{"type": "image_generation"}],
-                        chat_model, chat_effort, cache_key)
+                        chat_model, chat_effort, cache_key, chat_timeout, calls)
                     break
                 except Exception as e:
-                    if not (image_data_url and getattr(e, "status_code", None) == 500):
+                    status_code = getattr(e, "status_code", None)
+                    is_server_error = status_code is not None and status_code >= 500
+                    is_at_capacity = status_code == 429 and "capacity" in str(getattr(e, "body", None) or e)
+                    if not image_data_url and (is_server_error or is_at_capacity):
+                        log_error("on_message fallback", f"{chat_model} {type(e).__name__}: {e}", {
+                            **describe_exception(e),
+                            "input": redact_long_strings(input_messages),
+                        })
+                        retry_on_image_model = True
+                        break
+                    if not (image_data_url and status_code == 500):
                         raise
                     log_error("on_message", f"500 with image+tool on {chat_model}, attempt {attempt + 1}",
                               {"message": str(e)[:200]})
+
+            if retry_on_image_model:
+                chat_model, chat_effort, base_cache_key, chat_timeout = (
+                    IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT, "grokbot-image", image_chat_timeout_seconds)
+                response_obj = await create_chat_response(
+                    input_messages, [{"type": "image_generation"}],
+                    chat_model, chat_effort, base_cache_key, chat_timeout, calls)
 
             if response_obj is None:
                 # Should not happen now that images go to 4.6, but a reply beats an
                 # error message. Drop the tool so the image at least gets looked at.
                 log_error("on_message", "image+tool failed every attempt, dropping the tool")
                 response_obj = await create_chat_response(
-                    input_messages, [], chat_model, chat_effort, base_cache_key)
+                    input_messages, [], chat_model, chat_effort, base_cache_key, chat_timeout, calls)
 
             full_response = response_obj.model_dump()
             output_items = full_response.get("output", [])
@@ -480,9 +551,12 @@ async def on_message(message):
                 try:
                     # A separate cache key: the appended message breaks the cached
                     # prefix anyway, and this keeps the normal one intact.
+                    # NOTE: Always on 4.6, even when the first try was on 4.3. Of 5
+                    # de-named retries that ran on 4.3, 3 died with "500 token parsing".
                     retry_obj = await create_chat_response(
                         retry_messages, [{"type": "image_generation"}],
-                        chat_model, chat_effort, f"{base_cache_key}-denamed")
+                        IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT, "grokbot-image-denamed",
+                        image_chat_timeout_seconds, calls)
                     retry_response = retry_obj.model_dump()
                     retry_items = retry_response.get("output", [])
                     # Only take the retry if it actually produced a picture.
@@ -492,12 +566,13 @@ async def on_message(message):
                            for item in retry_items):
                         print("¤De-named retry produced an image")
                         response_obj, full_response, output_items = retry_obj, retry_response, retry_items
+                        chat_model, chat_effort = IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT
                     else:
                         log_error("image rejected", "de-named retry also came back with no image", {
                             "output_items": [item.get("type") for item in retry_items],
                         })
                 except asyncio.TimeoutError:
-                    log_error("image rejected", f"de-named retry timed out after {timeout_seconds}s")
+                    log_error("image rejected", f"de-named retry timed out after {image_chat_timeout_seconds}s")
                 except Exception as e:
                     log_error("image rejected", f"de-named retry failed: {type(e).__name__}: {e}",
                               describe_exception(e))
@@ -516,21 +591,9 @@ async def on_message(message):
                             text_parts.append(chunk["text"].strip())
                 elif item_type == "image_generation_call" and item.get("result"):
                     image_bytes = base64.b64decode(item["result"])
-                    # Discord needs the file extension to match the real bytes or
-                    # the attachment will not preview or download properly. The
-                    # docs say JPEG but PNG comes back too, so check the header
-                    # instead of trusting either.
-                    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-                        extension = "png"
-                    elif image_bytes.startswith(b"GIF8"):
-                        extension = "gif"
-                    elif image_bytes[8:12] == b"WEBP":
-                        extension = "webp"
-                    else:
-                        extension = "jpg"
                     generated_images.append(discord.File(
                         io.BytesIO(image_bytes),
-                        filename=f"grok_image_{len(generated_images) + 1}.{extension}",
+                        filename=f"grok_image_{len(generated_images) + 1}.{image_file_extension(image_bytes)}",
                     ))
 
             raw_answer = "\n\n".join(text_parts)
@@ -582,21 +645,37 @@ async def on_message(message):
 
         except asyncio.TimeoutError:
             response = "⚠️ - Request timed out"
-            log_error("on_message", f"timed out after {timeout_seconds}s")
+            log_error("on_message", f"timed out after {chat_timeout}s on {chat_model}", {"calls": calls})
         except Exception as e:
             # The exact request too. A 500 from xAI is their fault, but it is
             # usually triggered by something specific in the input, and the reply
             # chain history is the part nothing else records.
             log_error("on_message", f"{type(e).__name__}: {str(e)}", {
                 **describe_exception(e),
-                "input": input_messages,
+                "calls": calls,
+                "input": redact_long_strings(input_messages),
             })
-            if getattr(e, "status_code", None) == 429:
-                response = "⚠️ - 'code': 'Some resource has been exhausted', 'error': 'Your team has either used all available credits or reached its monthly spending limit. To continue making API requests, please purchase more credits or raise your spending limit."
+            status_code = getattr(e, "status_code", None)
+            tried_models = f" (tried both {CHAT_MODEL} and {IMAGE_CHAT_MODEL})" if retry_on_image_model else ""
+            if status_code == 429:
+                # NOTE: xAI sends 429 both for "out of credits" and for "model at
+                # capacity" (all 3 seen Aug-Oct 2026 were capacity). The openai SDK
+                # puts xAI's own explanation in e.body, which says which one it is.
+                rate_limit_reason = str(getattr(e, "body", None) or e)
+                if "capacity" in rate_limit_reason:
+                    response = f"⚠️ - xAI's servers are overloaded right now, not a bot problem{tried_models}. Try again in a few minutes"
+                elif "credits" in rate_limit_reason:
+                    response = "⚠️ - Out of xAI credits or the monthly spending limit is reached"
+                else:
+                    response = f"⚠️ - xAI rate limit: {rate_limit_reason}"
+            elif status_code is not None and status_code >= 500:
+                response = f"⚠️ - xAI had an internal error ({status_code}), not a bot problem{tried_models}. Try again"
             else:
-                response = "⚠️ - An unexpected error occurred, code: " + str(getattr(e, "status_code", None))
+                response = "⚠️ - An unexpected error occurred, code: " + str(status_code)
 
+    seconds = round(time.monotonic() - started, 2)
     print(f"¤Bot Final Message: {response}")
+    print(f"¤Took {seconds}s, calls: {calls}")
 
     # ── Log the interaction ───────────────────────────────────────────────────
     server_name  = message.guild.name if message.guild else "DM"
@@ -626,6 +705,8 @@ async def on_message(message):
         image_attached=bool(image_data_url),
         output_items=[item.get("type") for item in output_items],
         raw_answer=raw_answer if raw_answer != response else None,
+        seconds=seconds,
+        calls=calls,
     )
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -642,10 +723,17 @@ async def on_message(message):
 async def ask_with_search(interaction: discord.Interaction, question: str):
     await interaction.response.defer()
 
-    if random.random() < 0.01:
-        await interaction.followup.send("kill yourself")
+    # One roll so each canned reply is exactly 1%.
+    canned_reply_roll = random.random()
+    # Same "**Q: ...**" header as a real answer, so it reads like one.
+    if canned_reply_roll < 0.01:
+        await interaction.followup.send(f"**Q: {question}**\n\nkill yourself")
+        return
+    if canned_reply_roll < 0.02:
+        await interaction.followup.send(f"**Q: {question}**\n\nCan you please shut the fuck up with these retarded questions and get a job, I'm tired of all your bullshit")
         return
 
+    started = time.monotonic()
     try:
         response_obj = await asyncio.wait_for(
             client.responses.create(
@@ -670,11 +758,21 @@ async def ask_with_search(interaction: discord.Interaction, question: str):
     except Exception as e:
         log_error("/search", f"{type(e).__name__}: {str(e)}", describe_exception(e))
         if getattr(e, "status_code", None) == 429:
-            response = "⚠️ - Rate limit hit. Out of credits or monthly spending limit reached."
+            rate_limit_reason = str(getattr(e, "body", None) or e)
+            if "capacity" in rate_limit_reason:
+                response = "⚠️ - xAI's servers are overloaded right now, not a bot problem. Try again in a few minutes"
+            elif "credits" in rate_limit_reason:
+                response = "⚠️ - Out of xAI credits or the monthly spending limit is reached"
+            else:
+                response = f"⚠️ - xAI rate limit: {rate_limit_reason}"
+        elif (getattr(e, "status_code", None) or 0) >= 500:
+            response = f"⚠️ - xAI had an internal error ({e.status_code}), not a bot problem. Try again"
         else:
             response = "⚠️ - An unexpected error occurred, code: " + str(getattr(e, "status_code", None))
 
+    seconds = round(time.monotonic() - started, 2)
     print(f"¤/ask Final Message: {response}")
+    print(f"¤Took {seconds}s")
 
     server_name = interaction.guild.name if interaction.guild else "DM"
     log_interaction(
@@ -683,6 +781,7 @@ async def ask_with_search(interaction: discord.Interaction, question: str):
         user=interaction.user.name,
         question=f"[/ask] {question}",
         answer=response,
+        seconds=seconds,
     )
 
     reply = f"**Q: {question}**\n\n{response}"
@@ -741,6 +840,8 @@ async def generate_image(
     if model == "grok-imagine-image-2.0":
         extra["quality"] = quality
 
+    started = time.monotonic()
+    calls = []
     try:
         response = await asyncio.wait_for(
             client.images.generate(
@@ -751,24 +852,70 @@ async def generate_image(
             ),
             timeout=image_timeout_seconds
         )
+        calls.append({"call": model, "seconds": round(time.monotonic() - started, 2), "outcome": "ok"})
 
         image_urls = [image.url for image in response.data if image.url]
 
         if image_urls:
+            # Uploaded as a file rather than posted as a link. A link is not an
+            # attachment, so a reply to it ("make it longer") never carried the
+            # image and went to grok-4.3 blind: 7 of its "500 token parsing" errors
+            # were exactly that. The imgen.x.ai links are temporary as well. The
+            # link is only posted when the upload is not possible.
+            upload_limit = interaction.guild.filesize_limit if interaction.guild else 10 * 1024 * 1024
+            image_files = []
+            link_only_urls = []
+            # A separate client because the api key has no business being sent to
+            # the image host.
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as download_http:
+                for image_url in image_urls:
+                    download_started = time.monotonic()
+                    try:
+                        download = await download_http.get(image_url)
+                    except Exception as e:
+                        log_error("/generate_image", f"download failed: {type(e).__name__}: {e}", describe_exception(e))
+                        link_only_urls.append(image_url)
+                        calls.append({"call": "download", "seconds": round(time.monotonic() - download_started, 2),
+                                      "outcome": type(e).__name__})
+                        continue
+                    if download.status_code >= 400:
+                        log_error("/generate_image", f"download returned {download.status_code}", {"url": image_url})
+                        link_only_urls.append(image_url)
+                        download_outcome = f"HTTP {download.status_code}"
+                    elif len(download.content) >= upload_limit:
+                        log_error("/generate_image", f"too big to upload: {len(download.content)} bytes, limit {upload_limit}")
+                        link_only_urls.append(image_url)
+                        download_outcome = "too big"
+                    else:
+                        image_files.append(discord.File(
+                            io.BytesIO(download.content),
+                            filename=f"grok_image_{len(image_files) + 1}.{image_file_extension(download.content)}",
+                        ))
+                        download_outcome = "ok"
+                    calls.append({"call": "download", "seconds": round(time.monotonic() - download_started, 2),
+                                  "outcome": download_outcome})
+
+            seconds = round(time.monotonic() - started, 2)
+            print(f"¤/generate_image took {seconds}s, calls: {calls}")
+
             server_name = interaction.guild.name if interaction.guild else "DM"
             log_interaction(
                 server=server_name,
                 channel=str(interaction.channel),
                 user=interaction.user.name,
                 question=f"[/generate_image] {prompt} ({model}, {aspect_ratio}, {resolution}, {quality})",
-                answer=f"[{len(image_urls)} image URL(s) returned, ${cost:.2f}]: " + " ".join(image_urls),
+                answer=f"[{len(image_urls)} image URL(s) returned, {len(image_files)} uploaded, ${cost:.2f}]: "
+                       + " ".join(image_urls),
+                seconds=seconds,
+                calls=calls,
             )
             settings = f"{model} · {aspect_ratio} · {resolution} · {quality} · ${cost:.2f}"
             await interaction.followup.send(
                 f"{interaction.user.mention} Here's your image!\n"
                 f"**Prompt:** {prompt}\n"
-                f"-# {settings}\n"
-                + "\n".join(image_urls)
+                f"-# {settings}"
+                + "".join("\n" + url for url in link_only_urls),
+                files=image_files,
             )
         else:
             await interaction.followup.send(
@@ -781,7 +928,10 @@ async def generate_image(
             f"{interaction.user.mention} ⏱️ Image generation timed out. Please try again."
         )
     except Exception as e:
-        log_error("/generate_image", f"{type(e).__name__}: {str(e)}", describe_exception(e))
+        log_error("/generate_image", f"{type(e).__name__}: {str(e)}", {
+            **describe_exception(e),
+            "seconds": round(time.monotonic() - started, 2),
+        })
         await interaction.followup.send(
             f"{interaction.user.mention} ❌ An error occurred: `{str(e)}`"
         )
@@ -840,6 +990,8 @@ async def generate_video(
 
     video_url = None
     video_file = None
+    started = time.monotonic()
+    calls = []
 
     try:
         await interaction.edit_original_response(content=f"⏳ Generating video…\n{header}")
@@ -859,6 +1011,7 @@ async def generate_video(
 
         print(f"¤/generate_video started {request_id}")
         payload = await poll_video_generation(request_id)
+        calls.append({"call": VIDEO_MODEL, "seconds": round(time.monotonic() - started, 2), "outcome": "ok"})
         video_url = (payload.get("video") or {}).get("url")
         if not video_url:
             raise RuntimeError("finished with no video url: " + json.dumps(redact_long_strings(payload))[:400])
@@ -869,9 +1022,12 @@ async def generate_video(
         # well under that. A separate client because the request goes to a
         # different host and the api key has no business being sent there.
         upload_limit = interaction.guild.filesize_limit if interaction.guild else 10 * 1024 * 1024
+        download_started = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as download_http:
                 download = await download_http.get(video_url)
+            calls.append({"call": "download", "seconds": round(time.monotonic() - download_started, 2),
+                          "outcome": f"HTTP {download.status_code}"})
             if download.status_code >= 400:
                 log_error("/generate_video", f"download returned {download.status_code}", {"url": video_url})
             elif len(download.content) >= upload_limit:
@@ -907,6 +1063,8 @@ async def generate_video(
         except Exception as e:
             log_error("/generate_video", f"could not clear the progress message: {type(e).__name__}: {e}")
 
+        seconds = round(time.monotonic() - started, 2)
+        print(f"¤/generate_video took {seconds}s, calls: {calls}")
         server_name = interaction.guild.name if interaction.guild else "DM"
         log_interaction(
             server=server_name,
@@ -915,6 +1073,8 @@ async def generate_video(
             question=f"[/generate_video] {prompt} ({VIDEO_MODEL}, {aspect_ratio}, {VIDEO_RESOLUTION}, {VIDEO_DURATION_SECONDS}s)",
             answer=f"[${cost:.2f}, {'uploaded' if video_file else 'link only'}]: {video_url or 'no video'}",
             image_attached=bool(image),
+            seconds=seconds,
+            calls=calls,
         )
 
 
@@ -1021,25 +1181,35 @@ async def poll_video_generation(request_id: str) -> dict:
         await asyncio.sleep(video_poll_interval_seconds)
 
 
-async def create_chat_response(input_messages: list, tools: list, model: str, effort: str, cache_key: str):
-    return await asyncio.wait_for(
-        client.responses.create(
-            model=model,
-            input=input_messages,
-            reasoning={"effort": effort},
-            # Routes to a server that already holds the cached prefix. Caching
-            # itself is automatic; this only avoids landing on a cold server and
-            # paying full input price. Changing the key is also the only lever we
-            # have over which server answers.
-            prompt_cache_key=cache_key,
-            # Grok decides on its own when a message deserves a picture. Uses
-            # grok-imagine-image-2.0 internally at $0.04-0.08 per image.
-            # No web search for normal chat
-            tools=tools,
-            temperature=0.8,
-        ),
-        timeout=timeout_seconds
-    )
+async def create_chat_response(input_messages: list, tools: list, model: str, effort: str, cache_key: str, timeout: float,
+                               calls: list):
+    """One chat request. Appends {"call", "seconds", "outcome"} to calls whether it works or not."""
+    started = time.monotonic()
+    outcome = "ok"
+    try:
+        return await asyncio.wait_for(
+            client.responses.create(
+                model=model,
+                input=input_messages,
+                reasoning={"effort": effort},
+                # Routes to a server that already holds the cached prefix. Caching
+                # itself is automatic; this only avoids landing on a cold server and
+                # paying full input price. Changing the key is also the only lever we
+                # have over which server answers.
+                prompt_cache_key=cache_key,
+                # Grok decides on its own when a message deserves a picture. Uses
+                # grok-imagine-image-2.0 internally at $0.04-0.08 per image.
+                # No web search for normal chat
+                tools=tools,
+                temperature=0.8,
+            ),
+            timeout=timeout
+        )
+    except Exception as e:
+        outcome = f"{type(e).__name__} {getattr(e, 'status_code', None) or ''}".strip()
+        raise
+    finally:
+        calls.append({"call": model, "seconds": round(time.monotonic() - started, 2), "outcome": outcome})
 
 
 async def get_conversation_history(message, max_messages=8):
