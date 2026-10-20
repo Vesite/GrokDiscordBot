@@ -210,10 +210,12 @@ video_poll_interval_seconds = 3
 video_timeout_seconds = 600
 # ─────────────────────────────────────────────────────────────────────────────
 
-# "none" keeps the old fast non-reasoning behaviour. Verified against the API:
-# 0 reasoning tokens billed, ~1.3s replies. "low" burns ~95 reasoning tokens per
-# reply and is slower, so only switch if answers start feeling too dumb.
-REASONING_EFFORT = "none"
+# Used for chat, /search and /summarize on grok-4.3. "none" is 0 reasoning tokens
+# and ~1.3s replies, "low" ~95 reasoning tokens per reply and a bit slower.
+# NOTE: Switched to "low" in Oct 2026. At "none" Grok kept getting the message
+# tools wrong: dropped the author filter, used mentions instead of author, and
+# claimed it could not search by date. Set back to "none" if replies feel too slow.
+REASONING_EFFORT = "low"
 
 # grok-4.6 has no "none" setting - low, medium, high and xhigh only - so image
 # replies always pay for some thinking. low is the cheapest it offers.
@@ -283,19 +285,20 @@ SEARCH_MESSAGES_TOOL = {
         " time period like 'in 2023' or 'last summer'. For what was just said use"
         " read_recent_messages instead. Fill in only the filters the question needs. Results"
         " are oldest first, each with its date, channel and who sent it. Dates are UTC."
-        " For the oldest or first messages, for example the first message in the server or"
-        " someone's first message, set oldest_first and a small max_results."
+        " For the oldest or first messages, for example the first message in the channel or"
+        " someone's first message, set oldest_first and a small max_results, and keep the"
+        " author and dates the question names."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "author": {
                 "type": "string",
-                "description": "Only messages sent by this person: their name as it appears in the conversation, without the @.",
+                "description": "Only messages SENT by this person: their name as it appears in the conversation, without the @. When the user asks what @someone said, sent, wrote or thinks, that person is the author.",
             },
             "mentions": {
                 "type": "string",
-                "description": "Only messages that @mention this person, for what others said to or about them. Name without the @.",
+                "description": "Only messages that @mention this person, for what OTHER people said to or about them. Not for what the person said themselves, that is author. Name without the @.",
             },
             "text": {
                 "type": "string",
@@ -406,6 +409,8 @@ role_description = (
     "Every user message starts with the sender's name and a colon, like 'Daniel: hi', so you know who is talking. @Name means that person was mentioned. Never start your own reply with a name and a colon."
     "\n"
     "Messages you read with a tool each start with an id like [m12]. To link to one, write {m12} in your reply and it becomes a link to that message. Link when the user asks for links or where a message is, otherwise don't. A message marked [image] can have its images shown: write {image:m12} and they are attached to your reply. Show them when the user asks to see the message or the image. Never write the ids in any other form."
+    "\n"
+    "Ids only exist for messages read in this reply. If the user asks for the link or image of a message talked about earlier, search for it again to get its id. You can search this channel's whole history all the way back with search_messages, by person, words and dates, so never say you cannot see older messages or that a message is too old to link."
     "\n"
 )
 
@@ -985,11 +990,11 @@ async def on_message(message):
     # NOTE: At most 4, and Discord takes at most 10 files per message in total.
     shown_image_urls = []
     # Read from raw_answer too, the cleanup above removes ![...]({image:m12}) whole.
-    for message_ref in re.findall(r"\{image:(m\d+)\}", f"{raw_answer or ''}\n{response}"):
+    for message_ref in re.findall(r"[{\[]image:(m\d+)[}\]]", f"{raw_answer or ''}\n{response}"):
         for image_url in found_messages.get(message_ref, {}).get("images", []):
             if image_url not in shown_image_urls:
                 shown_image_urls.append(image_url)
-    response = re.sub(r"\{image:m\d+\}", "", response)
+    response = re.sub(r"[{\[]image:m\d+[}\]](?!\()", "", response)
     shown_images = []
     upload_limit: int = message.guild.filesize_limit if message.guild else 10 * 1024 * 1024
     images_to_show = shown_image_urls[:min(4, 10 - len(generated_images))]
@@ -1009,8 +1014,11 @@ async def on_message(message):
                                                  filename=image_url.split("?")[0].rsplit("/", 1)[-1] or "image.png"))
         if len(shown_images) < len(images_to_show):
             response += "\n(some images could not be attached)"
-    # Unknown ids are dropped rather than shown as {m99}.
-    response = re.sub(r"\{(m\d+)\}", lambda match: found_messages.get(match.group(1), {}).get("link", ""), response)
+    # Unknown ids are dropped rather than shown as {m99}. [m12] too, Grok sometimes
+    # copies the format it sees in the tool output.
+    response = re.sub(r"[{\[](m\d+)[}\]](?!\()", lambda match: found_messages.get(match.group(1), {}).get("link", ""), response)
+    # A marker that sat inside a markdown link, like [pic]({image:m2}), leaves [pic]() behind. Keep just the text.
+    response = re.sub(r"!?\[([^\]]*)\]\(\s*\)", r"\1", response)
     # NOTE: Added in code rather than left to Grok, so it is never forgotten.
     footer: str = f"\n-# {message_read_limit_note}" if message_read_limit_note else ""
     # The cut leaves room for the footer, Discord refuses anything over 2000.
@@ -1145,8 +1153,9 @@ async def summarize(interaction: discord.Interaction,
                     input_messages, [], IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT, "grokbot-summary",
                     summary_timeout_seconds, calls)
             response = response_obj.output_text or "⚠️ - No response generated"
-            response = re.sub(r"\{image:m\d+\}", "", response)
-            response = re.sub(r"\{(m\d+)\}", lambda match: found_messages.get(match.group(1), {}).get("link", ""), response)
+            response = re.sub(r"[{\[]image:m\d+[}\]](?!\()", "", response)
+            response = re.sub(r"[{\[](m\d+)[}\]](?!\()", lambda match: found_messages.get(match.group(1), {}).get("link", ""), response)
+            response = re.sub(r"!?\[([^\]]*)\]\(\s*\)", r"\1", response)
             print(f"¤/summarize answered by {summary_model}")
 
     except discord.Forbidden:
@@ -1598,7 +1607,8 @@ async def read_recent_messages(channel, hours: float, before, found_messages: di
     now = discord.utils.utcnow()
     user_name = user_name.strip().lstrip("@").strip()
     wanted_name: str = user_name.casefold()
-    lines = []
+    # (line without id, jump link, image urls), newest first while reading.
+    entries = []
     scanned_count: int = 0
     oldest_scanned_age: str = ""
     # Who did post, so a filter that matched nobody can tell Grok the real names.
@@ -1642,12 +1652,19 @@ async def read_recent_messages(channel, hours: float, before, found_messages: di
             continue
 
         author = "you (the bot)" if past_message.author == bot.user else past_message.author.display_name
-        message_ref: str = f"m{len(found_messages) + 1}"
-        found_messages[message_ref] = {"link": past_message.jump_url, "images": image_urls}
-        lines.append(f"[{message_ref}] [{age}] {author}: {text}")
-        if len(lines) >= RECENT_MESSAGES_MAX_COUNT:
+        entries.append((f"[{age}] {author}: {text}", past_message.jump_url, image_urls))
+        if len(entries) >= RECENT_MESSAGES_MAX_COUNT:
             break
-    lines.reverse()
+    entries.reverse()
+
+    # NOTE: Ids are handed out only now, so they count up in the order Grok reads
+    # them. Numbered while reading newest first, m1 was the newest message and
+    # Grok took it for the first one.
+    lines = []
+    for line_text, jump_url, image_urls in entries:
+        message_ref: str = f"m{len(found_messages) + 1}"
+        found_messages[message_ref] = {"link": jump_url, "images": image_urls}
+        lines.append(f"[{message_ref}] {line_text}")
 
     limit_note = ""
     if len(lines) >= RECENT_MESSAGES_MAX_COUNT:
@@ -1810,7 +1827,8 @@ async def search_messages(message: discord.Message, arguments: dict, found_messa
     # Without duplicates, oldest first, since snowflake ids grow with time.
     raw_messages = sorted({found["id"]: found for found in raw_messages}.values(), key=lambda found: int(found["id"]))
 
-    lines = []
+    # (line without id, jump link, image urls), oldest first.
+    entries = []
     for raw_message in raw_messages:
         channel_id: int = int(raw_message["channel_id"])
         thread_data = threads_by_id.get(channel_id)
@@ -1853,12 +1871,17 @@ async def search_messages(message: discord.Message, arguments: dict, found_messa
         author_data: dict = raw_message["author"]
         author_name: str = "you (the bot)" if int(author_data["id"]) == bot.user.id else name_of(author_data)
         # ISO timestamp, the first 10 characters are the date.
-        message_ref: str = f"m{len(found_messages) + 1}"
-        found_messages[message_ref] = {"link": f"https://discord.com/channels/{guild.id}/{channel_id}/{raw_message['id']}",
-                                       "images": image_urls}
-        lines.append(f"[{message_ref}] [{raw_message['timestamp'][:10]} #{channel_name}] {author_name}: {text}")
+        entries.append((f"[{raw_message['timestamp'][:10]} #{channel_name}] {author_name}: {text}",
+                        f"https://discord.com/channels/{guild.id}/{channel_id}/{raw_message['id']}", image_urls))
     # NOTE: Trimmed after the permission check, so hidden messages do not use up max_results.
-    lines = lines[:max_results] if oldest_first else lines[-max_results:]
+    entries = entries[:max_results] if oldest_first else entries[-max_results:]
+
+    # Ids only now, so they count up in reading order like read_recent_messages.
+    lines = []
+    for line_text, message_link, image_urls in entries:
+        message_ref: str = f"m{len(found_messages) + 1}"
+        found_messages[message_ref] = {"link": message_link, "images": image_urls}
+        lines.append(f"[{message_ref}] {line_text}")
 
     limit_note = ""
     if spread_pages and total_results > 10000:
