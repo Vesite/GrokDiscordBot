@@ -1,4 +1,5 @@
 import json
+import math
 import random
 import base64
 import io
@@ -253,8 +254,8 @@ READ_RECENT_MESSAGES_TOOL = {
         " who said what, what people were talking about or arguing about. Do not use it for"
         f" anything else. At most {RECENT_MESSAGES_MAX_HOURS} hours."
         " When the question is about what one specific person said, pass user so only their"
-        " messages come back. For anything older than that, other channels, or a specific"
-        " time period, use search_messages instead."
+        " messages come back. For anything older than that, a specific time period, or the"
+        " oldest or first messages, use search_messages instead."
     ),
     "parameters": {
         "type": "object",
@@ -276,12 +277,14 @@ SEARCH_MESSAGES_TOOL = {
     "type": "function",
     "name": "search_messages",
     "description": (
-        "Search this whole Discord server's message history with Discord's own search, all the"
-        " way back. Use it for what a specific person has said or thinks, what people said to"
-        " or about someone or something, a specific time period like 'in 2023' or 'last"
-        " summer', or other channels. For what was just said in this channel use"
+        "Search this Discord channel's whole message history with Discord's own search, all the"
+        " way back. Only this channel, never other channels. Use it for what a specific person"
+        " has said or thinks, what people said to or about someone or something, or a specific"
+        " time period like 'in 2023' or 'last summer'. For what was just said use"
         " read_recent_messages instead. Fill in only the filters the question needs. Results"
         " are oldest first, each with its date, channel and who sent it. Dates are UTC."
+        " For the oldest or first messages, for example the first message in the server or"
+        " someone's first message, set oldest_first and a small max_results."
     ),
     "parameters": {
         "type": "object",
@@ -306,9 +309,13 @@ SEARCH_MESSAGES_TOOL = {
                 "type": "string",
                 "description": "Last day to include, as YYYY-MM-DD.",
             },
-            "this_channel_only": {
+            "oldest_first": {
                 "type": "boolean",
-                "description": "Only search the channel the question was asked in.",
+                "description": "Take the oldest matching messages instead of the newest.",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": f"How many messages to read, 1-{RECENT_MESSAGES_MAX_COUNT}. Leave it out to read as many as possible, spread over all the matches.",
             },
         },
     },
@@ -360,7 +367,10 @@ management_team_id = ""
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+# NOTE: Grok's replies are unfiltered, so "say @everyone" would otherwise ping the
+# whole server. This blocks @everyone and @here for every message the bot sends.
+bot = commands.Bot(command_prefix='!', intents=intents,
+                   allowed_mentions=discord.AllowedMentions(everyone=False))
 
 @bot.event
 async def on_ready():
@@ -394,6 +404,8 @@ role_description = (
     "Never say something failed for copyright or IP reasons before you have actually tried it, and never bring copyright up on your own."
     "\n"
     "Every user message starts with the sender's name and a colon, like 'Daniel: hi', so you know who is talking. @Name means that person was mentioned. Never start your own reply with a name and a colon."
+    "\n"
+    "Messages you read with a tool each start with an id like [m12]. To link to one, write {m12} in your reply and it becomes a link to that message. Link when the user asks for links or where a message is, otherwise don't. A message marked [image] can have its images shown: write {image:m12} and they are attached to your reply. Show them when the user asks to see the message or the image. Never write the ids in any other form."
     "\n"
 )
 
@@ -432,11 +444,15 @@ async def on_message(message):
     calls = []
     # Set when a channel read or search hit a limit, shown under the reply.
     message_read_limit_note = ""
+    # "m12" -> {"link": jump link, "images": image urls}, filled by the tools,
+    # used for {m12} and {image:m12} in the reply.
+    found_messages: dict[str, dict] = {}
 
     user_input = readable_message_text(message)
     role_description_extra = ""
     all_attachments = list(message.attachments)
 
+    referenced_message = None
     if message.reference:
         referenced_message = message.reference.resolved
         # resolved is None if it was never cached, and a DeletedReferencedMessage
@@ -485,15 +501,49 @@ async def on_message(message):
             f"\nALWAYS note that the user sent {len(image_attachments)} images"
             f" but you can only look at the first {MAX_INPUT_IMAGES}")
 
-    # Discord shows a preview for links but that preview is not an attachment, so
-    # nothing behind a link ever reaches the model. Left unsaid it will invent a
-    # description rather than admit it cannot look, because the prompt tells it to
-    # never deny a request.
-    if re.search(r"https?://", user_input):
+    # Discord's own link previews (embeds): title, description, site. That is all
+    # the model ever gets of a link. Left unsaid it will invent the rest of the
+    # page rather than admit it cannot look, because the prompt tells it to never
+    # deny a request.
+    # NOTE: Discord often adds the embed a moment after the message is posted, so
+    # a message with a link and no embed yet is fetched again once.
+    embed_message = message
+    if re.search(r"https?://", message.content) and not message.embeds:
+        await asyncio.sleep(1.5)
+        try:
+            embed_message = await message.channel.fetch_message(message.id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+    link_previews = []
+    for preview_message, where in ((embed_message, ""), (referenced_message, " (in the message they replied to)")):
+        if not isinstance(preview_message, discord.Message):
+            continue
+        for embed in preview_message.embeds:
+            if embed.type in ("image", "gifv"):
+                link_previews.append(f"- an image or gif link{where}, you cannot see it")
+                continue
+            source: str = " / ".join(part for part in (embed.provider.name, embed.author.name) if part)
+            title: str = embed.title or ""
+            description: str = (embed.description or "")[:300]
+            if not (title or description):
+                continue
+            preview_line: str = f"- {source + ': ' if source else ''}{title}"
+            if description:
+                preview_line += f" - {description}"
+            link_previews.append(preview_line + where)
+
+    if link_previews:
+        role_description_extra += (
+            "\nDiscord's preview of the links, which is all you know about them:\n" + "\n".join(link_previews) +
+            "\nYou cannot open links, you only have this preview. Answer from it when it is enough,"
+            " otherwise say plainly that you can't open links. Never guess at the rest of the page."
+        )
+    elif re.search(r"https?://", user_input):
         role_description_extra += (
             "\nThe user's message contains a link. You cannot open links or see anything behind them."
             " Never pretend you can, and never describe or guess at what is on a linked page."
         )
+    if re.search(r"https?://", user_input):
         if not image_data_urls:
             role_description_extra += (
                 " If they wanted you to look at or edit an image, tell them to upload it to Discord"
@@ -643,7 +693,7 @@ async def on_message(message):
             # read_recent_messages. The messages are fetched here and handed back
             # in a follow-up request that continues the stored response. A few
             # rounds in case it wants a longer window after seeing the first one.
-            for _ in range(3):
+            for tool_round in range(3):
                 function_calls = [item for item in response_obj.model_dump().get("output", [])
                                   if item.get("type") == "function_call"]
                 if not function_calls:
@@ -659,7 +709,7 @@ async def on_message(message):
                             function_arguments = {}
                         fetch_started = time.monotonic()
                         try:
-                            function_output, message_count, limit_note = await search_messages(message, function_arguments)
+                            function_output, message_count, limit_note = await search_messages(message, function_arguments, found_messages)
                             fetch_outcome = f"{message_count} messages, {function_arguments}"
                             if limit_note:
                                 fetch_outcome += ", hit count limit"
@@ -671,6 +721,11 @@ async def on_message(message):
                             function_output = f"The search failed (Discord error {e.status}). Tell the user it did not work."
                             fetch_outcome = f"HTTP {e.status}"
                             log_error("search_messages", f"{e.status}: {e.text}", {"arguments": function_arguments})
+                        except Exception as e:
+                            function_output = "The search failed. Tell the user it did not work."
+                            fetch_outcome = type(e).__name__
+                            log_error("search_messages", f"{type(e).__name__}: {e}",
+                                      {**describe_exception(e), "arguments": function_arguments})
                         calls.append({"call": "search_messages",
                                       "seconds": round(time.monotonic() - fetch_started, 2),
                                       "outcome": fetch_outcome})
@@ -683,12 +738,15 @@ async def on_message(message):
                         except (ValueError, TypeError, AttributeError):
                             function_arguments = {}
                             hours = 24
+                        # NOTE: NaN slips through min/max and then crashes timedelta.
+                        if not math.isfinite(hours):
+                            hours = 24
                         hours = min(max(hours, 0.1), RECENT_MESSAGES_MAX_HOURS)
                         user_name_filter = str(function_arguments.get("user") or "")
                         fetch_started = time.monotonic()
                         try:
                             function_output, message_count, limit_note = await read_recent_messages(
-                                message.channel, hours, message, user_name_filter)
+                                message.channel, hours, message, found_messages, user_name_filter)
                             fetch_outcome = f"{message_count} messages, {hours:g}h"
                             if user_name_filter:
                                 fetch_outcome += f", user {user_name_filter}"
@@ -698,6 +756,11 @@ async def on_message(message):
                         except discord.Forbidden:
                             function_output = "The bot is not allowed to read this channel's message history."
                             fetch_outcome = "Forbidden"
+                        except Exception as e:
+                            function_output = "Reading the channel failed. Tell the user it did not work."
+                            fetch_outcome = type(e).__name__
+                            log_error("read_recent_messages", f"{type(e).__name__}: {e}",
+                                      {**describe_exception(e), "arguments": function_arguments})
                         calls.append({"call": "read_recent_messages",
                                       "seconds": round(time.monotonic() - fetch_started, 2),
                                       "outcome": fetch_outcome})
@@ -708,8 +771,11 @@ async def on_message(message):
                     })
                 # Answering over a big pile of messages takes longer than a normal reply.
                 chat_timeout = max(chat_timeout, summary_timeout_seconds)
+                # NOTE: The last round leaves the read tools out, otherwise a third
+                # function call would end the loop with no answer at all.
+                round_tools = chat_tools if tool_round < 2 else [{"type": "image_generation"}]
                 response_obj = await create_chat_response(
-                    function_outputs, chat_tools, chat_model, chat_effort, base_cache_key,
+                    function_outputs, round_tools, chat_model, chat_effort, base_cache_key,
                     chat_timeout, calls, previous_response_id=response_obj.id)
 
             full_response = response_obj.model_dump()
@@ -915,6 +981,36 @@ async def on_message(message):
     )
     # ─────────────────────────────────────────────────────────────────────────
 
+    # Images Grok asked to show with {image:m12}, downloaded and attached like generated ones.
+    # NOTE: At most 4, and Discord takes at most 10 files per message in total.
+    shown_image_urls = []
+    # Read from raw_answer too, the cleanup above removes ![...]({image:m12}) whole.
+    for message_ref in re.findall(r"\{image:(m\d+)\}", f"{raw_answer or ''}\n{response}"):
+        for image_url in found_messages.get(message_ref, {}).get("images", []):
+            if image_url not in shown_image_urls:
+                shown_image_urls.append(image_url)
+    response = re.sub(r"\{image:m\d+\}", "", response)
+    shown_images = []
+    upload_limit: int = message.guild.filesize_limit if message.guild else 10 * 1024 * 1024
+    images_to_show = shown_image_urls[:min(4, 10 - len(generated_images))]
+    if images_to_show:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as download_http:
+            for image_url in images_to_show:
+                try:
+                    download = await download_http.get(image_url)
+                    download.raise_for_status()
+                except httpx.HTTPError as e:
+                    log_error("show found image", f"{type(e).__name__}: {e}", {"url": image_url})
+                    continue
+                if len(download.content) >= upload_limit:
+                    log_error("show found image", f"too big to upload: {len(download.content)} bytes", {"url": image_url})
+                    continue
+                shown_images.append(discord.File(io.BytesIO(download.content),
+                                                 filename=image_url.split("?")[0].rsplit("/", 1)[-1] or "image.png"))
+        if len(shown_images) < len(images_to_show):
+            response += "\n(some images could not be attached)"
+    # Unknown ids are dropped rather than shown as {m99}.
+    response = re.sub(r"\{(m\d+)\}", lambda match: found_messages.get(match.group(1), {}).get("link", ""), response)
     # NOTE: Added in code rather than left to Grok, so it is never forgotten.
     footer: str = f"\n-# {message_read_limit_note}" if message_read_limit_note else ""
     # The cut leaves room for the footer, Discord refuses anything over 2000.
@@ -922,7 +1018,10 @@ async def on_message(message):
         response = response[:1900 - len(footer)] + "... (message limit reached)"
     response += footer
     # content must be None rather than "" when the reply is images only.
-    await message.reply(response or None, files=generated_images)
+    # NOTE: Not message.reply, which fails outright if the question was deleted while
+    # Grok was answering. This replies when it can and just posts when it can not.
+    await message.channel.send(response or None, files=generated_images + shown_images,
+                               reference=message.to_reference(fail_if_not_exists=False))
 
 
 
@@ -1010,9 +1109,11 @@ async def summarize(interaction: discord.Interaction,
     calls = []
     message_count = 0
     limit_note = ""
+    found_messages: dict[str, dict] = {}
     try:
         fetch_started = time.monotonic()
-        recent_messages, message_count, limit_note = await read_recent_messages(interaction.channel, hours, None)
+        recent_messages, message_count, limit_note = await read_recent_messages(
+            interaction.channel, hours, None, found_messages)
         calls.append({"call": "read_recent_messages", "seconds": round(time.monotonic() - fetch_started, 2),
                       "outcome": f"{message_count} messages, {hours}h" + (", hit count limit" if limit_note else "")})
 
@@ -1044,6 +1145,8 @@ async def summarize(interaction: discord.Interaction,
                     input_messages, [], IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT, "grokbot-summary",
                     summary_timeout_seconds, calls)
             response = response_obj.output_text or "⚠️ - No response generated"
+            response = re.sub(r"\{image:m\d+\}", "", response)
+            response = re.sub(r"\{(m\d+)\}", lambda match: found_messages.get(match.group(1), {}).get("link", ""), response)
             print(f"¤/summarize answered by {summary_model}")
 
     except discord.Forbidden:
@@ -1210,7 +1313,7 @@ async def generate_image(
             settings = f"{model} · {aspect_ratio} · {resolution} · {quality} · ${cost:.2f}"
             await interaction.followup.send(
                 f"{interaction.user.mention} Here's your image!\n"
-                f"**Prompt:** {prompt}\n"
+                f"**Prompt:** {prompt[:1500]}\n"
                 f"-# {settings}"
                 + "".join("\n" + url for url in link_only_urls),
                 files=image_files,
@@ -1231,7 +1334,7 @@ async def generate_image(
             "seconds": round(time.monotonic() - started, 2),
         })
         await interaction.followup.send(
-            f"{interaction.user.mention} ❌ An error occurred: `{str(e)}`"
+            f"{interaction.user.mention} ❌ An error occurred: `{str(e)[:300]}`"
         )
 
 
@@ -1480,11 +1583,13 @@ async def poll_video_generation(request_id: str) -> dict:
         await asyncio.sleep(video_poll_interval_seconds)
 
 
-async def read_recent_messages(channel, hours: float, before, user_name: str = "") -> tuple[str, int, str]:
+async def read_recent_messages(channel, hours: float, before, found_messages: dict, user_name: str = "") -> tuple[str, int, str]:
     """The channel's messages from the last hours as text for the model, how many
     there were, and a note for the user when the count limit cut the window short.
 
-    Oldest first, one per line: "[2h05m ago] name: text". Ages instead of clock
+    Oldest first, one per line: "[m12] [2h05m ago] name: text". The id is added to
+    found_messages with the message's jump link and image urls, so Grok can use
+    {m12} and {image:m12}. Ages instead of clock
     times, so no timezone has to be guessed. before excludes the asking message.
     user_name keeps only that person's messages, matched case insensitively on
     display name, username or global name. The note is "" when no limit was hit.
@@ -1525,16 +1630,21 @@ async def read_recent_messages(channel, hours: float, before, user_name: str = "
         text = past_message.clean_content.strip()
         if len(text) > RECENT_MESSAGE_MAX_CHARS:
             text = text[:RECENT_MESSAGE_MAX_CHARS] + " ...(cut)"
+        image_urls = []
         for attachment in past_message.attachments:
-            if (attachment.content_type or "").startswith("image/"):
+            if (attachment.content_type or "").startswith("image/") \
+                    or attachment.filename.lower().endswith(('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp')):
                 text += " [image]"
+                image_urls.append(attachment.url)
             else:
                 text += f" [file: {attachment.filename}]"
         if not text:
             continue
 
         author = "you (the bot)" if past_message.author == bot.user else past_message.author.display_name
-        lines.append(f"[{age}] {author}: {text}")
+        message_ref: str = f"m{len(found_messages) + 1}"
+        found_messages[message_ref] = {"link": past_message.jump_url, "images": image_urls}
+        lines.append(f"[{message_ref}] [{age}] {author}: {text}")
         if len(lines) >= RECENT_MESSAGES_MAX_COUNT:
             break
     lines.reverse()
@@ -1588,14 +1698,15 @@ async def find_member(message: discord.Message, name: str) -> Optional[discord.M
     return None
 
 
-async def search_messages(message: discord.Message, arguments: dict) -> tuple[str, int, str]:
-    """Discord's own server wide message search, as text for the model, how many
+async def search_messages(message: discord.Message, arguments: dict, found_messages: dict) -> tuple[str, int, str]:
+    """Discord's own message search over the asking channel, as text for the model, how many
     messages there were, and a note for the user when only part of the matches
     could be read ("" if all were).
 
-    NOTE: Only messages from channels the asker can read themselves are kept, so
-    the bot can not be used to look into channels they are not allowed in.
-    Private threads are always left out, their membership is not visible here.
+    Each line gets an id like m12 in found_messages, the same as read_recent_messages.
+    Only the asking channel is searched. The permission check below is a second
+    guard: only messages from channels the asker can read are kept, and private
+    threads are always left out, their membership is not visible here.
     discord.py 2.7 has no wrapper for this endpoint, so it is called directly.
     Discord gives 25 results per page and stops at offset 9975, so only the
     newest 10000 matches are reachable. With more than RECENT_MESSAGES_MAX_COUNT
@@ -1606,8 +1717,14 @@ async def search_messages(message: discord.Message, arguments: dict) -> tuple[st
     if guild is None:
         return "Searching only works in a server, not in DMs.", 0, ""
 
-    params = [("sort_by", "timestamp"), ("sort_order", "desc"), ("limit", "25")]
-    described_filters = []
+    oldest_first: bool = arguments.get("oldest_first") is True
+    try:
+        max_results: int = int(arguments.get("max_results") or RECENT_MESSAGES_MAX_COUNT)
+    except (ValueError, TypeError):
+        max_results = RECENT_MESSAGES_MAX_COUNT
+    max_results = min(max(max_results, 1), RECENT_MESSAGES_MAX_COUNT)
+    params = [("sort_by", "timestamp"), ("sort_order", "asc" if oldest_first else "desc"), ("limit", "25")]
+    described_filters = ["the oldest matches"] if oldest_first else []
     for argument_key, search_key, filter_description in (("author", "author_id", "sent by"),
                                                          ("mentions", "mentions", "mentioning")):
         person_name: str = str(arguments.get(argument_key) or "").strip().lstrip("@").strip()
@@ -1634,16 +1751,15 @@ async def search_messages(message: discord.Message, arguments: dict) -> tuple[st
         except ValueError:
             return f"{argument_key} has to look like 2023-05-14, not {date_text!r}.", 0, ""
         if argument_key == "start_date":
-            params.append(("min_id", str(discord.utils.time_snowflake(day) - 1)))
+            params.append(("min_id", str(max(discord.utils.time_snowflake(day) - 1, 0))))
             described_filters.append(f"from {date_text}")
         else:
             # The next midnight, so the whole end day is included.
-            params.append(("max_id", str(discord.utils.time_snowflake(day + timedelta(days=1)))))
+            params.append(("max_id", str(max(discord.utils.time_snowflake(day + timedelta(days=1)), 0))))
             described_filters.append(f"until {date_text}")
 
-    if arguments.get("this_channel_only") is True:
-        params.append(("channel_id", str(message.channel.id)))
-        described_filters.append("in this channel only")
+    # NOTE: Always only the channel the question was asked in.
+    params.append(("channel_id", str(message.channel.id)))
     # NOTE: NSFW channels only when asked from one, so they never end up in a normal channel.
     if message.channel.is_nsfw():
         params.append(("include_nsfw", "true"))
@@ -1663,8 +1779,11 @@ async def search_messages(message: discord.Message, arguments: dict) -> tuple[st
 
     total_results: int = int(data.get("total_results") or 0)
     reachable_count: int = min(total_results, 10000)
-    if reachable_count <= RECENT_MESSAGES_MAX_COUNT:
-        page_offsets = list(range(25, reachable_count, 25))
+    # Spread only when Grok wants as many as possible and there are more than fit.
+    # With a max_results it gets the first ones in sort order instead.
+    spread_pages: bool = max_results == RECENT_MESSAGES_MAX_COUNT and reachable_count > max_results
+    if not spread_pages:
+        page_offsets = list(range(25, min(reachable_count, max_results), 25))
     else:
         page_count: int = RECENT_MESSAGES_MAX_COUNT // 25
         page_offsets = [round(page_number * (reachable_count - 25) / (page_count - 1))
@@ -1688,14 +1807,11 @@ async def search_messages(message: discord.Message, arguments: dict) -> tuple[st
             return member.display_name
         return user_data.get("global_name") or user_data.get("username") or "unknown"
 
-    lines = []
-    seen_message_ids = set()
-    # Snowflake ids grow with time, so this is oldest first.
-    for raw_message in sorted(raw_messages, key=lambda found: int(found["id"])):
-        if raw_message["id"] in seen_message_ids:
-            continue
-        seen_message_ids.add(raw_message["id"])
+    # Without duplicates, oldest first, since snowflake ids grow with time.
+    raw_messages = sorted({found["id"]: found for found in raw_messages}.values(), key=lambda found: int(found["id"]))
 
+    lines = []
+    for raw_message in raw_messages:
         channel_id: int = int(raw_message["channel_id"])
         thread_data = threads_by_id.get(channel_id)
         channel = guild.get_channel_or_thread(channel_id)
@@ -1723,9 +1839,12 @@ async def search_messages(message: discord.Message, arguments: dict) -> tuple[st
         text = text.strip()
         if len(text) > RECENT_MESSAGE_MAX_CHARS:
             text = text[:RECENT_MESSAGE_MAX_CHARS] + " ...(cut)"
+        image_urls = []
         for attachment in raw_message.get("attachments", []):
-            if (attachment.get("content_type") or "").startswith("image/"):
+            if (attachment.get("content_type") or "").startswith("image/") \
+                    or (attachment.get("filename") or "").lower().endswith(('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp')):
                 text += " [image]"
+                image_urls.append(attachment["url"])
             else:
                 text += f" [file: {attachment.get('filename')}]"
         if not text:
@@ -1734,22 +1853,27 @@ async def search_messages(message: discord.Message, arguments: dict) -> tuple[st
         author_data: dict = raw_message["author"]
         author_name: str = "you (the bot)" if int(author_data["id"]) == bot.user.id else name_of(author_data)
         # ISO timestamp, the first 10 characters are the date.
-        lines.append(f"[{raw_message['timestamp'][:10]} #{channel_name}] {author_name}: {text}")
+        message_ref: str = f"m{len(found_messages) + 1}"
+        found_messages[message_ref] = {"link": f"https://discord.com/channels/{guild.id}/{channel_id}/{raw_message['id']}",
+                                       "images": image_urls}
+        lines.append(f"[{message_ref}] [{raw_message['timestamp'][:10]} #{channel_name}] {author_name}: {text}")
+    # NOTE: Trimmed after the permission check, so hidden messages do not use up max_results.
+    lines = lines[:max_results] if oldest_first else lines[-max_results:]
 
     limit_note = ""
-    if total_results > 10000:
+    if spread_pages and total_results > 10000:
         limit_note = (f"Only {len(lines)} of about {total_results} matching messages were read,"
-                      " spread over the newest 10000")
-    elif total_results > RECENT_MESSAGES_MAX_COUNT:
+                      f" spread over the {'oldest' if oldest_first else 'newest'} 10000")
+    elif spread_pages:
         limit_note = (f"Only {len(lines)} of about {total_results} matching messages were read,"
                       " spread evenly over them")
 
-    filters_text: str = ", ".join(described_filters) or "no filters, the whole server"
+    filters_text: str = ", ".join(described_filters) or "no filters, the whole channel"
     if not lines:
         output = f"No messages found ({filters_text})."
     else:
-        output = (f"{len(lines)} messages found ({filters_text}), oldest first, as"
-                  " [date #channel] name: text:\n" + "\n".join(lines))
+        output = (f"{len(lines)} messages read of about {total_results} found ({filters_text}), oldest first, as"
+                  " [id] [date #channel] name: text:\n" + "\n".join(lines))
     if limit_note:
         output = f"{limit_note}.\n" + output
     return output, len(lines), limit_note
