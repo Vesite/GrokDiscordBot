@@ -14,6 +14,7 @@ from PIL import Image
 from datetime import datetime, timezone, timedelta
 from discord.ext import commands
 from discord import app_commands
+from discord.http import Route
 from openai import AsyncOpenAI, omit
 
 
@@ -228,10 +229,14 @@ IMAGE_TOOL_ATTEMPTS = 1
 
 # ── Reading recent channel messages ──────────────────────────────────────────
 # Used by the read_recent_messages tool (Grok decides when) and by /summarize.
-# Only ever the channel the request came from. At the limits, 2500 messages is
-# roughly 60-125k tokens, about $0.08-0.16 on grok-4.3. Most reads are far smaller.
+# Only ever the channel the request came from. At the limits, 1200 messages is
+# roughly 30-60k tokens, about $0.04-0.08 on grok-4.3. Most reads are far smaller.
 RECENT_MESSAGES_MAX_HOURS = 168
-RECENT_MESSAGES_MAX_COUNT = 2500
+# The most messages Grok is ever handed in one read, also for search_messages.
+RECENT_MESSAGES_MAX_COUNT = 1200
+# NOTE: Scanning is free, only what reaches Grok costs, so a read filtered to one
+# person may look through far more. The cost is time: 100 messages per request.
+RECENT_MESSAGES_MAX_SCANNED = 15000
 # One long paste should not eat the whole budget.
 RECENT_MESSAGE_MAX_CHARS = 300
 # A big read means a big prompt, which takes longer than a normal reply.
@@ -247,6 +252,9 @@ READ_RECENT_MESSAGES_TOOL = {
         " conversation you were given: summarising, 'what did I miss', catching someone up,"
         " who said what, what people were talking about or arguing about. Do not use it for"
         f" anything else. At most {RECENT_MESSAGES_MAX_HOURS} hours."
+        " When the question is about what one specific person said, pass user so only their"
+        " messages come back. For anything older than that, other channels, or a specific"
+        " time period, use search_messages instead."
     ),
     "parameters": {
         "type": "object",
@@ -255,8 +263,54 @@ READ_RECENT_MESSAGES_TOOL = {
                 "type": "number",
                 "description": "How many hours back to read. Use what the question implies, or 24 if it says nothing.",
             },
+            "user": {
+                "type": "string",
+                "description": "Only read messages from this one person: their name as it appears in the conversation, without the @. Leave it out to read everyone.",
+            },
         },
         "required": ["hours"],
+    },
+}
+
+SEARCH_MESSAGES_TOOL = {
+    "type": "function",
+    "name": "search_messages",
+    "description": (
+        "Search this whole Discord server's message history with Discord's own search, all the"
+        " way back. Use it for what a specific person has said or thinks, what people said to"
+        " or about someone or something, a specific time period like 'in 2023' or 'last"
+        " summer', or other channels. For what was just said in this channel use"
+        " read_recent_messages instead. Fill in only the filters the question needs. Results"
+        " are oldest first, each with its date, channel and who sent it. Dates are UTC."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "author": {
+                "type": "string",
+                "description": "Only messages sent by this person: their name as it appears in the conversation, without the @.",
+            },
+            "mentions": {
+                "type": "string",
+                "description": "Only messages that @mention this person, for what others said to or about them. Name without the @.",
+            },
+            "text": {
+                "type": "string",
+                "description": "Only messages containing these words. Discord matches whole words.",
+            },
+            "start_date": {
+                "type": "string",
+                "description": "First day to include, as YYYY-MM-DD.",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Last day to include, as YYYY-MM-DD.",
+            },
+            "this_channel_only": {
+                "type": "boolean",
+                "description": "Only search the channel the question was asked in.",
+            },
+        },
     },
 }
 # ─────────────────────────────────────────────────────────────────────────────
@@ -339,6 +393,8 @@ role_description = (
     "\n"
     "Never say something failed for copyright or IP reasons before you have actually tried it, and never bring copyright up on your own."
     "\n"
+    "Every user message starts with the sender's name and a colon, like 'Daniel: hi', so you know who is talking. @Name means that person was mentioned. Never start your own reply with a name and a colon."
+    "\n"
 )
 
 emoji_list = "\nHere are some special emojis you can use ONLY IF APPROPRIATE: " \
@@ -374,8 +430,10 @@ async def on_message(message):
     # every xAI call and retry.
     started = time.monotonic()
     calls = []
+    # Set when a channel read or search hit a limit, shown under the reply.
+    message_read_limit_note = ""
 
-    user_input = message.content.replace(f'<@{bot.user.id}>', '').strip()
+    user_input = readable_message_text(message)
     role_description_extra = ""
     all_attachments = list(message.attachments)
 
@@ -443,6 +501,7 @@ async def on_message(message):
             )
     if not user_input and not all_attachments:
         user_input = "(the user sendt an empty message)"
+    user_turn_text = f"{message.author.display_name}: {user_input or '(no text provided)'}"
 
     # Build user content
     if len(image_data_urls) == 1:
@@ -466,7 +525,7 @@ async def on_message(message):
             },
             {
                 "type": "input_text",
-                "text": user_input or "(no text provided)",
+                "text": user_turn_text,
             },
         ]
     elif image_data_urls:
@@ -489,14 +548,15 @@ async def on_message(message):
         for image_label, image_data_url in labelled_images:
             user_content.append({"type": "input_text", "text": f"{image_label}:"})
             user_content.append({"type": "input_image", "image_url": image_data_url, "detail": "high"})
-        user_content.append({"type": "input_text", "text": user_input or "(no text provided)"})
+        user_content.append({"type": "input_text", "text": user_turn_text})
     else:
         system_extra = ""
-        user_content = user_input
+        user_content = user_turn_text
 
     # The first system message is byte-identical on every request, so it is the
     # part prompt caching can reuse. Anything that varies per message goes in a
     # second system message after it, otherwise the cached prefix is broken.
+    role_description_extra += f"\nToday's date is {discord.utils.utcnow():%Y-%m-%d} (UTC)."
     input_messages = [{"role": "system", "content": role_description + emoji_list}]
     if role_description_extra or system_extra:
         input_messages.append({"role": "system", "content": role_description_extra + system_extra})
@@ -513,7 +573,7 @@ async def on_message(message):
         chat_model, chat_effort, base_cache_key, chat_timeout = (
             CHAT_MODEL, REASONING_EFFORT, "grokbot-chat", timeout_seconds)
     # Grok picks between these itself: draw something, or read the channel first.
-    chat_tools = [{"type": "image_generation"}, READ_RECENT_MESSAGES_TOOL]
+    chat_tools = [{"type": "image_generation"}, READ_RECENT_MESSAGES_TOOL, SEARCH_MESSAGES_TOOL]
 
     generated_images = []
     output_items = []
@@ -590,18 +650,51 @@ async def on_message(message):
                     break
                 function_outputs = []
                 for function_call in function_calls:
-                    if function_call.get("name") != "read_recent_messages":
+                    if function_call.get("name") == "search_messages":
+                        try:
+                            function_arguments = json.loads(function_call.get("arguments") or "{}")
+                        except (ValueError, TypeError):
+                            function_arguments = {}
+                        if not isinstance(function_arguments, dict):
+                            function_arguments = {}
+                        fetch_started = time.monotonic()
+                        try:
+                            function_output, message_count, limit_note = await search_messages(message, function_arguments)
+                            fetch_outcome = f"{message_count} messages, {function_arguments}"
+                            if limit_note:
+                                fetch_outcome += ", hit count limit"
+                                message_read_limit_note = limit_note
+                        except discord.Forbidden:
+                            function_output = "The bot is not allowed to search this server's messages."
+                            fetch_outcome = "Forbidden"
+                        except discord.HTTPException as e:
+                            function_output = f"The search failed (Discord error {e.status}). Tell the user it did not work."
+                            fetch_outcome = f"HTTP {e.status}"
+                            log_error("search_messages", f"{e.status}: {e.text}", {"arguments": function_arguments})
+                        calls.append({"call": "search_messages",
+                                      "seconds": round(time.monotonic() - fetch_started, 2),
+                                      "outcome": fetch_outcome})
+                    elif function_call.get("name") != "read_recent_messages":
                         function_output = f"There is no function called {function_call.get('name')}."
                     else:
                         try:
-                            hours = float(json.loads(function_call.get("arguments") or "{}").get("hours", 24))
+                            function_arguments = json.loads(function_call.get("arguments") or "{}")
+                            hours = float(function_arguments.get("hours", 24))
                         except (ValueError, TypeError, AttributeError):
+                            function_arguments = {}
                             hours = 24
                         hours = min(max(hours, 0.1), RECENT_MESSAGES_MAX_HOURS)
+                        user_name_filter = str(function_arguments.get("user") or "")
                         fetch_started = time.monotonic()
                         try:
-                            function_output, message_count = await read_recent_messages(message.channel, hours, message)
+                            function_output, message_count, limit_note = await read_recent_messages(
+                                message.channel, hours, message, user_name_filter)
                             fetch_outcome = f"{message_count} messages, {hours:g}h"
+                            if user_name_filter:
+                                fetch_outcome += f", user {user_name_filter}"
+                            if limit_note:
+                                fetch_outcome += ", hit count limit"
+                                message_read_limit_note = limit_note
                         except discord.Forbidden:
                             function_output = "The bot is not allowed to read this channel's message history."
                             fetch_outcome = "Forbidden"
@@ -802,7 +895,7 @@ async def on_message(message):
     elif image_data_urls:
         logged_question = f"[{len(image_data_urls)} images attached] | {user_input or '(no text provided)'}"
     else:
-        logged_question = user_content or "(empty)"
+        logged_question = user_input or "(empty)"
 
     logged_answer = response
     if generated_images:
@@ -822,11 +915,14 @@ async def on_message(message):
     )
     # ─────────────────────────────────────────────────────────────────────────
 
-    if len(response) > 1900:
-        await message.reply(response[:1900] + "... (message limit reached)", files=generated_images)
-    else:
-        # content must be None rather than "" when the reply is images only.
-        await message.reply(response or None, files=generated_images)
+    # NOTE: Added in code rather than left to Grok, so it is never forgotten.
+    footer: str = f"\n-# {message_read_limit_note}" if message_read_limit_note else ""
+    # The cut leaves room for the footer, Discord refuses anything over 2000.
+    if len(response) + len(footer) > 1900:
+        response = response[:1900 - len(footer)] + "... (message limit reached)"
+    response += footer
+    # content must be None rather than "" when the reply is images only.
+    await message.reply(response or None, files=generated_images)
 
 
 
@@ -913,11 +1009,12 @@ async def summarize(interaction: discord.Interaction,
     started = time.monotonic()
     calls = []
     message_count = 0
+    limit_note = ""
     try:
         fetch_started = time.monotonic()
-        recent_messages, message_count = await read_recent_messages(interaction.channel, hours, None)
+        recent_messages, message_count, limit_note = await read_recent_messages(interaction.channel, hours, None)
         calls.append({"call": "read_recent_messages", "seconds": round(time.monotonic() - fetch_started, 2),
-                      "outcome": f"{message_count} messages, {hours}h"})
+                      "outcome": f"{message_count} messages, {hours}h" + (", hit count limit" if limit_note else "")})
 
         if message_count == 0:
             response = f"No messages in this channel in the last {hours}h."
@@ -982,7 +1079,10 @@ async def summarize(interaction: discord.Interaction,
         calls=calls,
     )
 
-    reply = f"**Summary of the last {hours}h** ({message_count} messages)\n\n{response}"
+    reply = f"**Summary of the last {hours}h** ({message_count} messages)"
+    if limit_note:
+        reply += f"\n-# {limit_note}"
+    reply += f"\n\n{response}"
     if len(reply) > 1900:
         await interaction.followup.send(reply[:1900] + "... (message limit reached)")
     else:
@@ -1380,18 +1480,47 @@ async def poll_video_generation(request_id: str) -> dict:
         await asyncio.sleep(video_poll_interval_seconds)
 
 
-async def read_recent_messages(channel, hours: float, before) -> tuple[str, int]:
-    """The channel's messages from the last hours as text for the model, and how many there were.
+async def read_recent_messages(channel, hours: float, before, user_name: str = "") -> tuple[str, int, str]:
+    """The channel's messages from the last hours as text for the model, how many
+    there were, and a note for the user when the count limit cut the window short.
 
     Oldest first, one per line: "[2h05m ago] name: text". Ages instead of clock
     times, so no timezone has to be guessed. before excludes the asking message.
+    user_name keeps only that person's messages, matched case insensitively on
+    display name, username or global name. The note is "" when no limit was hit.
+    An unfiltered read sends everything it scans, so it only scans RECENT_MESSAGES_MAX_COUNT.
     """
     now = discord.utils.utcnow()
+    user_name = user_name.strip().lstrip("@").strip()
+    wanted_name: str = user_name.casefold()
     lines = []
+    scanned_count: int = 0
+    oldest_scanned_age: str = ""
+    # Who did post, so a filter that matched nobody can tell Grok the real names.
+    names_seen: set[str] = set()
     # Newest first, so hitting the count limit drops the oldest messages rather
     # than the newest. Reversed at the end.
-    async for past_message in channel.history(limit=RECENT_MESSAGES_MAX_COUNT, before=before,
+    scan_limit: int = RECENT_MESSAGES_MAX_SCANNED if wanted_name else RECENT_MESSAGES_MAX_COUNT
+    async for past_message in channel.history(limit=scan_limit, before=before,
                                               after=now - timedelta(hours=hours), oldest_first=False):
+        scanned_count += 1
+        minutes_ago = int((now - past_message.created_at).total_seconds() // 60)
+        if minutes_ago >= 24 * 60:
+            age = f"{minutes_ago // (24 * 60)}d{minutes_ago % (24 * 60) // 60}h ago"
+        elif minutes_ago >= 60:
+            age = f"{minutes_ago // 60}h{minutes_ago % 60:02d}m ago"
+        else:
+            age = f"{minutes_ago}m ago"
+        oldest_scanned_age = age
+
+        if wanted_name:
+            author_names = (past_message.author.display_name, past_message.author.name,
+                            getattr(past_message.author, "global_name", None))
+            if wanted_name not in [name.casefold() for name in author_names if name]:
+                if past_message.author != bot.user:
+                    names_seen.add(past_message.author.display_name)
+                continue
+
         # clean_content turns <@123> mentions into readable @names.
         text = past_message.clean_content.strip()
         if len(text) > RECENT_MESSAGE_MAX_CHARS:
@@ -1404,23 +1533,226 @@ async def read_recent_messages(channel, hours: float, before) -> tuple[str, int]
         if not text:
             continue
 
-        minutes_ago = int((now - past_message.created_at).total_seconds() // 60)
-        if minutes_ago >= 24 * 60:
-            age = f"{minutes_ago // (24 * 60)}d{minutes_ago % (24 * 60) // 60}h ago"
-        elif minutes_ago >= 60:
-            age = f"{minutes_ago // 60}h{minutes_ago % 60:02d}m ago"
-        else:
-            age = f"{minutes_ago}m ago"
         author = "you (the bot)" if past_message.author == bot.user else past_message.author.display_name
         lines.append(f"[{age}] {author}: {text}")
+        if len(lines) >= RECENT_MESSAGES_MAX_COUNT:
+            break
     lines.reverse()
 
-    if not lines:
-        return f"There were no messages in this channel in the last {hours:g} hours.", 0
-    header = f"{len(lines)} messages from the last {hours:g} hours in this channel, oldest first"
+    limit_note = ""
     if len(lines) >= RECENT_MESSAGES_MAX_COUNT:
-        header += f" (only the newest {RECENT_MESSAGES_MAX_COUNT}, older ones in that window were not read)"
-    return header + ":\n" + "\n".join(lines), len(lines)
+        limit_note = f"Only the newest {RECENT_MESSAGES_MAX_COUNT} messages were read, back to {oldest_scanned_age}"
+    elif scanned_count >= scan_limit:
+        limit_note = f"Stopped after looking through {scan_limit} messages, back to {oldest_scanned_age}"
+
+    window = f"the last {hours:g} hours"
+    if not lines and wanted_name and names_seen:
+        output = (f"No messages from {user_name} in {window}. People who did post: {', '.join(sorted(names_seen))}."
+                  " If one of them is the person meant, call again with that exact name.")
+    elif not lines:
+        output = f"There were no messages in this channel in {window}."
+    else:
+        from_who = f" from {user_name}" if wanted_name else ""
+        output = f"{len(lines)} messages{from_who} from {window} in this channel, oldest first:\n" + "\n".join(lines)
+    if limit_note:
+        output = f"{limit_note}, older ones in that window were not read.\n" + output
+    return output, len(lines), limit_note
+
+
+async def find_member(message: discord.Message, name: str) -> Optional[discord.Member]:
+    """The member of message's server called name, or None.
+
+    Matches display name, username or global name, case insensitive. People
+    mentioned in the asking message come first, since those are exact.
+    NOTE: The bot has no members intent, so the cache only knows people seen
+    recently. query_members asks Discord directly and works without that intent,
+    but matches the start of a username or nickname, so a single hit is taken as
+    the answer and several are treated as unclear.
+    """
+    wanted_name: str = name.casefold()
+    candidates = [member for member in message.mentions if isinstance(member, discord.Member)]
+    cached_member = message.guild.get_member_named(name)
+    if cached_member is not None:
+        candidates.append(cached_member)
+    try:
+        candidates.extend(await message.guild.query_members(query=name, limit=10))
+    except (asyncio.TimeoutError, discord.ClientException):
+        pass
+    for member in candidates:
+        if wanted_name in [member_name.casefold() for member_name in
+                           (member.display_name, member.name, member.global_name) if member_name]:
+            return member
+    queried_ids = {member.id for member in candidates if member not in message.mentions}
+    if len(queried_ids) == 1:
+        return next(member for member in candidates if member.id in queried_ids)
+    return None
+
+
+async def search_messages(message: discord.Message, arguments: dict) -> tuple[str, int, str]:
+    """Discord's own server wide message search, as text for the model, how many
+    messages there were, and a note for the user when only part of the matches
+    could be read ("" if all were).
+
+    NOTE: Only messages from channels the asker can read themselves are kept, so
+    the bot can not be used to look into channels they are not allowed in.
+    Private threads are always left out, their membership is not visible here.
+    discord.py 2.7 has no wrapper for this endpoint, so it is called directly.
+    Discord gives 25 results per page and stops at offset 9975, so only the
+    newest 10000 matches are reachable. With more than RECENT_MESSAGES_MAX_COUNT
+    matches, the pages are spread evenly over them so "in 2023" covers the whole
+    year instead of only December.
+    """
+    guild = message.guild
+    if guild is None:
+        return "Searching only works in a server, not in DMs.", 0, ""
+
+    params = [("sort_by", "timestamp"), ("sort_order", "desc"), ("limit", "25")]
+    described_filters = []
+    for argument_key, search_key, filter_description in (("author", "author_id", "sent by"),
+                                                         ("mentions", "mentions", "mentioning")):
+        person_name: str = str(arguments.get(argument_key) or "").strip().lstrip("@").strip()
+        if not person_name:
+            continue
+        member = await find_member(message, person_name)
+        if member is None:
+            return (f"Could not find anyone called {person_name} in this server. Ask the user to"
+                    " @mention them, or try their username instead."), 0, ""
+        params.append((search_key, str(member.id)))
+        described_filters.append(f"{filter_description} {member.display_name}")
+
+    search_text: str = str(arguments.get("text") or "").strip()[:1024]
+    if search_text:
+        params.append(("content", search_text))
+        described_filters.append(f"containing '{search_text}'")
+
+    for argument_key in ("start_date", "end_date"):
+        date_text: str = str(arguments.get(argument_key) or "").strip()
+        if not date_text:
+            continue
+        try:
+            day: datetime = datetime.strptime(date_text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return f"{argument_key} has to look like 2023-05-14, not {date_text!r}.", 0, ""
+        if argument_key == "start_date":
+            params.append(("min_id", str(discord.utils.time_snowflake(day) - 1)))
+            described_filters.append(f"from {date_text}")
+        else:
+            # The next midnight, so the whole end day is included.
+            params.append(("max_id", str(discord.utils.time_snowflake(day + timedelta(days=1)))))
+            described_filters.append(f"until {date_text}")
+
+    if arguments.get("this_channel_only") is True:
+        params.append(("channel_id", str(message.channel.id)))
+        described_filters.append("in this channel only")
+    # NOTE: NSFW channels only when asked from one, so they never end up in a normal channel.
+    if message.channel.is_nsfw():
+        params.append(("include_nsfw", "true"))
+
+    search_route = Route("GET", "/guilds/{guild_id}/messages/search", guild_id=guild.id)
+    # The first page's total_results decides which other pages to fetch. While
+    # Discord is still indexing a server it answers 202 with code 110000 and no results.
+    for attempt in range(3):
+        data = await bot.http.request(search_route, params=params + [("offset", "0")])
+        if data.get("code") != 110000 and "messages" in data:
+            break
+        if attempt < 2:
+            await asyncio.sleep(min(float(data.get("retry_after") or 2), 5))
+    else:
+        return ("Discord has not finished indexing this server for search yet."
+                " Tell the user to try again later."), 0, ""
+
+    total_results: int = int(data.get("total_results") or 0)
+    reachable_count: int = min(total_results, 10000)
+    if reachable_count <= RECENT_MESSAGES_MAX_COUNT:
+        page_offsets = list(range(25, reachable_count, 25))
+    else:
+        page_count: int = RECENT_MESSAGES_MAX_COUNT // 25
+        page_offsets = [round(page_number * (reachable_count - 25) / (page_count - 1))
+                        for page_number in range(1, page_count)]
+
+    # NOTE: Documented as a list of lists, from when it also sent surrounding context.
+    raw_messages = [found for group in data["messages"] for found in (group if isinstance(group, list) else [group])]
+    threads_by_id = {int(thread["id"]): thread for thread in data.get("threads", [])}
+    for page_offset in page_offsets:
+        page = await bot.http.request(search_route, params=params + [("offset", str(page_offset))])
+        page_messages = [found for group in page.get("messages", [])
+                         for found in (group if isinstance(group, list) else [group])]
+        if not page_messages:
+            break
+        raw_messages.extend(page_messages)
+        threads_by_id.update({int(thread["id"]): thread for thread in page.get("threads", [])})
+
+    def name_of(user_data: dict) -> str:
+        member = guild.get_member(int(user_data["id"]))
+        if member is not None:
+            return member.display_name
+        return user_data.get("global_name") or user_data.get("username") or "unknown"
+
+    lines = []
+    seen_message_ids = set()
+    # Snowflake ids grow with time, so this is oldest first.
+    for raw_message in sorted(raw_messages, key=lambda found: int(found["id"])):
+        if raw_message["id"] in seen_message_ids:
+            continue
+        seen_message_ids.add(raw_message["id"])
+
+        channel_id: int = int(raw_message["channel_id"])
+        thread_data = threads_by_id.get(channel_id)
+        channel = guild.get_channel_or_thread(channel_id)
+        if channel is None and thread_data is not None:
+            channel = guild.get_thread(channel_id) or guild.get_channel(int(thread_data["parent_id"]))
+        if thread_data is not None and thread_data.get("type") == discord.ChannelType.private_thread.value:
+            continue
+        if channel is None or getattr(channel, "type", None) == discord.ChannelType.private_thread:
+            continue
+        asker_permissions = channel.permissions_for(message.author)
+        if not (asker_permissions.read_messages and asker_permissions.read_message_history):
+            continue
+        channel_name: str = thread_data["name"] if thread_data is not None else channel.name
+
+        text: str = raw_message.get("content") or ""
+        for mentioned_user in raw_message.get("mentions", []):
+            mentioned_name: str = name_of(mentioned_user)
+            text = text.replace(f"<@{mentioned_user['id']}>", f"@{mentioned_name}")
+            text = text.replace(f"<@!{mentioned_user['id']}>", f"@{mentioned_name}")
+        for role_id in raw_message.get("mention_roles", []):
+            role = guild.get_role(int(role_id))
+            text = text.replace(f"<@&{role_id}>", f"@{role.name if role else 'deleted-role'}")
+        text = re.sub(r"<#(\d+)>", lambda match: "#" + getattr(
+            guild.get_channel_or_thread(int(match.group(1))), "name", "unknown-channel"), text)
+        text = text.strip()
+        if len(text) > RECENT_MESSAGE_MAX_CHARS:
+            text = text[:RECENT_MESSAGE_MAX_CHARS] + " ...(cut)"
+        for attachment in raw_message.get("attachments", []):
+            if (attachment.get("content_type") or "").startswith("image/"):
+                text += " [image]"
+            else:
+                text += f" [file: {attachment.get('filename')}]"
+        if not text:
+            continue
+
+        author_data: dict = raw_message["author"]
+        author_name: str = "you (the bot)" if int(author_data["id"]) == bot.user.id else name_of(author_data)
+        # ISO timestamp, the first 10 characters are the date.
+        lines.append(f"[{raw_message['timestamp'][:10]} #{channel_name}] {author_name}: {text}")
+
+    limit_note = ""
+    if total_results > 10000:
+        limit_note = (f"Only {len(lines)} of about {total_results} matching messages were read,"
+                      " spread over the newest 10000")
+    elif total_results > RECENT_MESSAGES_MAX_COUNT:
+        limit_note = (f"Only {len(lines)} of about {total_results} matching messages were read,"
+                      " spread evenly over them")
+
+    filters_text: str = ", ".join(described_filters) or "no filters, the whole server"
+    if not lines:
+        output = f"No messages found ({filters_text})."
+    else:
+        output = (f"{len(lines)} messages found ({filters_text}), oldest first, as"
+                  " [date #channel] name: text:\n" + "\n".join(lines))
+    if limit_note:
+        output = f"{limit_note}.\n" + output
+    return output, len(lines), limit_note
 
 
 async def create_chat_response(input_messages: list, tools: list, model: str, effort: str, cache_key: str, timeout: float,
@@ -1460,6 +1792,25 @@ async def create_chat_response(input_messages: list, tools: list, model: str, ef
         calls.append({"call": model, "seconds": round(time.monotonic() - started, 2), "outcome": outcome})
 
 
+def readable_message_text(message: discord.Message) -> str:
+    """The message text with the bot's own mention removed and other mentions as names.
+
+    Raw content has mentions as <@123...>, which Grok cannot connect to anyone.
+    Turned into @DisplayName, the same names read_recent_messages uses.
+    NOTE: Not clean_content, since that also turns the bot's mention into @BotName,
+    which would then have to be stripped back out by name.
+    """
+    text: str = re.sub(rf"<@!?{bot.user.id}>", "", message.content)
+    for mentioned_user in message.mentions:
+        text = text.replace(f"<@{mentioned_user.id}>", f"@{mentioned_user.display_name}")
+        text = text.replace(f"<@!{mentioned_user.id}>", f"@{mentioned_user.display_name}")
+    for mentioned_role in message.role_mentions:
+        text = text.replace(f"<@&{mentioned_role.id}>", f"@{mentioned_role.name}")
+    for mentioned_channel in message.channel_mentions:
+        text = text.replace(f"<#{mentioned_channel.id}>", f"#{mentioned_channel.name}")
+    return text.strip()
+
+
 async def get_conversation_history(message, max_messages=8):
     history = []
     current = message
@@ -1474,7 +1825,7 @@ async def get_conversation_history(message, max_messages=8):
             # Discord. Any of those just ends the chain.
             break
 
-        content = current.content.replace(f'<@{bot.user.id}>', '').strip()
+        content = readable_message_text(current)
         # An image-only message has no text at all, and skipping it silently
         # dropped the fact that a picture exists. In an edit chain that is the
         # whole point of the message.
@@ -1486,8 +1837,11 @@ async def get_conversation_history(message, max_messages=8):
         if len(content) > 2000:
             content = content[:2000] + " ...(truncated)"
 
-        role = "assistant" if current.author == bot.user else "user"
-        history.append({"role": role, "content": content})
+        if current.author == bot.user:
+            history.append({"role": "assistant", "content": content})
+        else:
+            # NOTE: Prefixed per message, so merged turns below keep who said each line.
+            history.append({"role": "user", "content": f"{current.author.display_name}: {content}"})
 
     history.reverse()
 
