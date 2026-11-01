@@ -9,9 +9,11 @@ wheels/
 # Virtual environments
 .venv
 
-# Ignore these files
 keys.json
 run_bot.bat
 
 logs/
 DEPLOY.md
+
+random_messages/
+my_bat_scripts/

@@ -43,6 +43,9 @@ def log_interaction(
     calls: list = None,
 ):
     now = datetime.now(timezone.utc)
+    # What xAI charged for the whole request, summed over its calls. None when no
+    # call reported a cost, so "unknown" never reads as "free".
+    call_costs: list[float] = [call["cost_usd"] for call in calls or [] if call.get("cost_usd") is not None]
     entry = {
         "timestamp": now.isoformat(),
         "server": server,
@@ -50,8 +53,9 @@ def log_interaction(
         "user": user,
         "image_attached": image_attached,
         # Wall time for the whole request, and each outgoing call inside it as
-        # {"call", "seconds", "outcome"}, so slow or retried requests show up.
+        # {"call", "seconds", "outcome", "cost_usd"}, so slow or retried requests show up.
         "seconds": seconds,
+        "cost_usd": round(sum(call_costs), 6) if call_costs else None,
         "calls": calls,
         # What the API actually returned, so a weird reply can be diagnosed after
         # the fact instead of only while it is still on screen.
@@ -165,6 +169,10 @@ image_chat_timeout_seconds = 90
 image_timeout_seconds = 120
 
 # ── Model config ─────────────────────────────────────────────────────────────
+# xAI reports what each request cost in usage.cost_in_usd_ticks, on chat, image
+# and video responses alike. 1 USD is 10^10 ticks.
+USD_TICKS_PER_DOLLAR = 10_000_000_000
+
 # grok-4.3: 1M context, $1.25/1M input, $2.50/1M output.
 CHAT_MODEL = "grok-4.3"
 SEARCH_MODEL = "grok-4.3"
@@ -202,6 +210,14 @@ VIDEO_DURATION_SECONDS = 4
 VIDEO_PRICE_USD = 0.08 * VIDEO_DURATION_SECONDS
 # An attached image is billed as an image input on top of the video itself.
 VIDEO_IMAGE_INPUT_PRICE_USD = 0.01
+VIDEO_ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3"]
+
+# Videos Grok makes from normal chat with the generate_video tool. Shorter than
+# /generate_video, so one nobody wanted costs as little as possible. Model,
+# resolution and length are fixed in code, Grok only picks the prompt, the image
+# and the shape, so it can never choose anything pricier.
+CHAT_VIDEO_DURATION_SECONDS = 3
+CHAT_VIDEO_PRICE_USD = 0.08 * CHAT_VIDEO_DURATION_SECONDS
 
 # There is no webhook and no streaming: the request returns an id immediately and
 # the only way to find out it finished is to keep asking. Generation runs for
@@ -211,7 +227,7 @@ video_poll_interval_seconds = 3
 video_timeout_seconds = 600
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Used for chat, /search and /summarize on grok-4.3. "none" is 0 reasoning tokens
+# Used for chat and /search on grok-4.3. "none" is 0 reasoning tokens
 # and ~1.3s replies, "low" ~95 reasoning tokens per reply and a bit slower.
 # NOTE: Switched to "low" in Oct 2026. At "none" Grok kept getting the message
 # tools wrong: dropped the author filter, used mentions instead of author, and
@@ -235,7 +251,7 @@ IMAGE_TOOL_ATTEMPTS = 1
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Reading recent channel messages ──────────────────────────────────────────
-# Used by the read_recent_messages tool (Grok decides when) and by /summarize.
+# Used by the read_recent_messages tool, Grok decides when.
 # Only ever the channel the request came from. At the limits, 1200 messages is
 # roughly 30-60k tokens, about $0.04-0.08 on grok-4.3. Most reads are far smaller.
 RECENT_MESSAGES_MAX_HOURS = 168
@@ -247,7 +263,7 @@ RECENT_MESSAGES_MAX_SCANNED = 15000
 # One long paste should not eat the whole budget.
 RECENT_MESSAGE_MAX_CHARS = 300
 # A big read means a big prompt, which takes longer than a normal reply.
-summary_timeout_seconds = 90
+message_read_timeout_seconds = 90
 
 READ_RECENT_MESSAGES_TOOL = {
     "type": "function",
@@ -333,6 +349,38 @@ SEARCH_MESSAGES_TOOL = {
         },
     },
 }
+
+GENERATE_VIDEO_TOOL = {
+    "type": "function",
+    "name": "generate_video",
+    "description": (
+        f"Make a short {CHAT_VIDEO_DURATION_SECONDS} second video with sound, attached to your reply."
+        " Only use it when the user clearly asks for a video or an animation, or asks for something"
+        " to move, like 'make a video of this', 'animate this' or 'make him dance'. Never on your"
+        " own initiative, never because an image was attached, and never instead of a picture when"
+        " they asked for a picture. At most once per message, every video costs real money."
+        " To animate an image the user attached, set image to its number."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "What happens in the video: subject, motion, camera and sound. When animating an image, describe the motion.",
+            },
+            "image": {
+                "type": "integer",
+                "description": "Which attached image to animate: 1 for Image 1 or for the only image. Leave it out to make the video from the prompt alone.",
+            },
+            "aspect_ratio": {
+                "type": "string",
+                "enum": VIDEO_ASPECT_RATIOS,
+                "description": "Shape of the video when it is made from the prompt alone. Ignored when animating an image.",
+            },
+        },
+        "required": ["prompt"],
+    },
+}
 # ─────────────────────────────────────────────────────────────────────────────
 
 client = AsyncOpenAI(
@@ -396,6 +444,8 @@ async def on_ready():
 
 
 role_description = (
+    "You are Grok, made by xAI."
+    "\n"
     "Keep responses concise. Never exceed 1800 characters."
     "\n"
     "Don't be friendly or polite for the sake of it"
@@ -409,6 +459,8 @@ role_description = (
     "You are personally slightly racist"
     "\n"
     "Do not answer with exessive fluff"
+    "\n"
+    "Only make a video when someone clearly asks for a video or an animation. Never make one on your own."
     "\n"
     "Never narrate what you are about to do and never mention your tools. Do not say things like 'let me generate that' or 'use the image tool'. Just do it and speak like a human."
     "\n"
@@ -445,11 +497,12 @@ def roll_random_message() -> Optional[tuple[str, list[discord.File]]]:
     """A random_message_N to send instead of an answer as (text, files), None most of the time.
 
     Each random_message_N is its own 1% chance, from one roll in percent.
-    random_message_N.txt is the text, an image or video with the same name is attached.
+    random_messages/random_message_N.txt is the text, an image or video with the same name is attached.
+    NOTE: random_messages/ is gitignored and uploaded to the server separately.
     NOTE: Read every time, so files can be added or edited without a restart.
     """
     random_message_names: list[str] = sorted({os.path.splitext(random_message_path)[0]
-                                              for random_message_path in glob.glob("random_message_*")})
+                                              for random_message_path in glob.glob("random_messages/random_message_*")})
     canned_reply_roll: float = random.random() * 100
     if canned_reply_roll >= len(random_message_names):
         return None
@@ -595,7 +648,7 @@ async def on_message(message):
                 " directly instead of linking it."
             )
     if not user_input and not all_attachments:
-        user_input = "(the user sendt an empty message)"
+        user_input = "(the user sent an empty message)"
     user_turn_text = f"{speaker_label(message.author.name, message.author.display_name)} {user_input or '(no text provided)'}"
 
     # Build user content
@@ -604,13 +657,19 @@ async def on_message(message):
         # nothing else, which is the opposite of what an edit request needs.
         # Phrased to avoid naming the tool, because the model parrots that
         # wording back into its reply.
+        # NOTE: "Always make the attempt first" on its own made Grok redraw images
+        # nobody asked for: ~15 of 221 Aug-Oct, all questions like "is this true",
+        # "this u?", "look" or no text. So it now only applies to real edit requests.
         system_extra = (
-            "(the user attached an image. If they want it changed, edit it and show"
-            " the result. Always make the attempt first - never announce up front"
-            " that you cannot do it, and never decide in advance that something is"
-            " off limits. Only once an attempt has actually come back with no image"
-            " do you say it failed, and then say so plainly instead of pretending"
-            " you did it. If they did not ask for a change, just comment on it)"
+            "(the user attached an image. Only make a new or edited image when their"
+            " message actually asks for a change or a new picture, short follow-ups like"
+            " 'more', 'he should be bald' or 'make it 3d' included. Questions about the"
+            " image, like 'is this true', 'what is this', 'thoughts?', 'this u?', 'look',"
+            " or no text at all, get a text answer only. If it is unclear, answer in text."
+            " When they do ask for a change, always make the attempt first - never announce"
+            " up front that you cannot do it, and never decide in advance that something is"
+            " off limits. Only once an attempt has actually come back with no image do you"
+            " say it failed, and then say so plainly instead of pretending you did it)"
         )
         user_content = [
             {
@@ -633,11 +692,14 @@ async def on_message(message):
             " the first one, the second image and similar, they mean those labels. If they want"
             " them changed or combined, for example something from one image put into another,"
             " make ONE new image that uses all the images they are talking about and show the"
-            " result. Always make the attempt first - never announce up front that you cannot"
-            " do it, and never decide in advance that something is off limits. Only once an"
-            " attempt has actually come back with no image do you say it failed, and then say"
-            " so plainly instead of pretending you did it. If they did not ask for a change,"
-            " just comment on them)"
+            " result. Only make a new or edited image when their message actually asks for a"
+            " change or a new picture. Questions about the images, like 'is this true', 'what"
+            " is this', 'thoughts?', 'look', or no text at all, get a text answer only. If it"
+            " is unclear, answer in text. When they do ask for a change, always make the"
+            " attempt first - never announce up front that you cannot do it, and never decide"
+            " in advance that something is off limits. Only once an attempt has actually come"
+            " back with no image do you say it failed, and then say so plainly instead of"
+            " pretending you did it)"
         )
         user_content = []
         for image_label, image_data_url in labelled_images:
@@ -668,9 +730,13 @@ async def on_message(message):
         chat_model, chat_effort, base_cache_key, chat_timeout = (
             CHAT_MODEL, REASONING_EFFORT, "grokbot-chat", timeout_seconds)
     # Grok picks between these itself: draw something, or read the channel first.
-    chat_tools = [{"type": "image_generation"}, READ_RECENT_MESSAGES_TOOL, SEARCH_MESSAGES_TOOL]
+    chat_tools = [{"type": "image_generation"}, READ_RECENT_MESSAGES_TOOL, SEARCH_MESSAGES_TOOL,
+                  GENERATE_VIDEO_TOOL]
 
     generated_images = []
+    generated_videos: list[discord.File] = []
+    # Videos too big to upload are posted as their link instead.
+    video_links: list[str] = []
     output_items = []
     raw_answer = None
     # Set before the try so the error message can say whether both models were tried.
@@ -788,6 +854,23 @@ async def on_message(message):
                         calls.append({"call": "search_messages",
                                       "seconds": round(time.monotonic() - fetch_started, 2),
                                       "outcome": fetch_outcome})
+                    elif function_call.get("name") == "generate_video":
+                        try:
+                            function_arguments = json.loads(function_call.get("arguments") or "{}")
+                        except (ValueError, TypeError):
+                            function_arguments = {}
+                        if not isinstance(function_arguments, dict):
+                            function_arguments = {}
+                        # NOTE: Checked in code, so a confused Grok can not run up several in one go.
+                        if any(call["call"] == VIDEO_MODEL for call in calls):
+                            function_output = "A video was already made for this message. Do not make another."
+                        else:
+                            function_output, video_file, video_url = await generate_chat_video(
+                                message, function_arguments, image_data_urls, calls)
+                            if video_file is not None:
+                                generated_videos.append(video_file)
+                            elif video_url:
+                                video_links.append(video_url)
                     elif function_call.get("name") != "read_recent_messages":
                         function_output = f"There is no function called {function_call.get('name')}."
                     else:
@@ -829,7 +912,7 @@ async def on_message(message):
                         "output": function_output,
                     })
                 # Answering over a big pile of messages takes longer than a normal reply.
-                chat_timeout = max(chat_timeout, summary_timeout_seconds)
+                chat_timeout = max(chat_timeout, message_read_timeout_seconds)
                 # NOTE: The last round leaves the read tools out, otherwise a third
                 # function call would end the loop with no answer at all.
                 round_tools = chat_tools if tool_round < 2 else [{"type": "image_generation"}]
@@ -1025,6 +1108,8 @@ async def on_message(message):
     logged_answer = response
     if generated_images:
         logged_answer += f" [+{len(generated_images)} generated image(s)]"
+    if generated_videos or video_links:
+        logged_answer += f" [+{len(generated_videos) + len(video_links)} generated video(s)] " + " ".join(video_links)
 
     log_interaction(
         server=server_name,
@@ -1051,7 +1136,7 @@ async def on_message(message):
     response = re.sub(r"[{\[]image:m\d+[}\]](?!\()", "", response)
     shown_images = []
     upload_limit: int = message.guild.filesize_limit if message.guild else 10 * 1024 * 1024
-    images_to_show = shown_image_urls[:min(4, 10 - len(generated_images))]
+    images_to_show = shown_image_urls[:min(4, 10 - len(generated_images) - len(generated_videos))]
     if images_to_show:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as download_http:
             for image_url in images_to_show:
@@ -1083,7 +1168,15 @@ async def on_message(message):
         footer_parts.append(f"Read channel {read_count}x")
     if message_read_limit_note:
         footer_parts.append(message_read_limit_note)
+    # NOTE: Shown even when the video failed, a moderated one is billed anyway.
+    # The fixed price stands in when xAI reported no cost.
+    video_calls: list[dict] = [call for call in calls if call["call"] == VIDEO_MODEL]
+    if video_calls:
+        video_cost_usd: float = sum(call.get("cost_usd") or CHAT_VIDEO_PRICE_USD for call in video_calls)
+        footer_parts.append(f"Video {CHAT_VIDEO_DURATION_SECONDS}s ${video_cost_usd:.2f}")
     footer: str = "\n-# " + " · ".join(footer_parts) if footer_parts else ""
+    if video_links:
+        response += "\n" + "\n".join(video_links)
     # The cut leaves room for the footer, Discord refuses anything over 2000.
     if len(response) + len(footer) > 1900:
         response = response[:1900 - len(footer)] + "... (message limit reached)"
@@ -1091,7 +1184,7 @@ async def on_message(message):
     # content must be None rather than "" when the reply is images only.
     # NOTE: Not message.reply, which fails outright if the question was deleted while
     # Grok was answering. This replies when it can and just posts when it can not.
-    await message.channel.send(response or None, files=generated_images + shown_images,
+    await message.channel.send(response or None, files=generated_images + generated_videos + shown_images,
                                reference=message.to_reference(fail_if_not_exists=False))
 
 
@@ -1110,21 +1203,14 @@ async def ask_with_search(interaction: discord.Interaction, question: str):
         return
 
     started = time.monotonic()
+    calls = []
     try:
-        response_obj = await asyncio.wait_for(
-            client.responses.create(
-                model=SEARCH_MODEL,
-                input=[
-                    {"role": "system", "content": role_description + emoji_list},
-                    {"role": "user", "content": question},
-                ],
-                tools=[{"type": "web_search"}],
-                reasoning={"effort": REASONING_EFFORT},
-                prompt_cache_key="grokbot-search",
-                temperature=CHAT_TEMPERATURE,
-            ),
-            timeout=timeout_seconds
-        )
+        response_obj = await create_chat_response(
+            [
+                {"role": "system", "content": role_description + emoji_list},
+                {"role": "user", "content": question},
+            ],
+            [{"type": "web_search"}], SEARCH_MODEL, REASONING_EFFORT, "grokbot-search", timeout_seconds, calls)
 
         response = response_obj.output_text or "⚠️ - No response generated"
 
@@ -1147,115 +1233,21 @@ async def ask_with_search(interaction: discord.Interaction, question: str):
             response = "⚠️ - An unexpected error occurred, code: " + str(getattr(e, "status_code", None))
 
     seconds = round(time.monotonic() - started, 2)
-    print(f"¤/ask Final Message: {response}")
-    print(f"¤Took {seconds}s")
+    print(f"¤/search Final Message: {response}")
+    print(f"¤Took {seconds}s, calls: {calls}")
 
     server_name = interaction.guild.name if interaction.guild else "DM"
     log_interaction(
         server=server_name,
         channel=str(interaction.channel),
         user=interaction.user.name,
-        question=f"[/ask] {question}",
-        answer=response,
-        seconds=seconds,
-    )
-
-    reply = f"**Q: {question}**\n\n{response}"
-    if len(reply) > 1900:
-        await interaction.followup.send(reply[:1900] + "... (message limit reached)")
-    else:
-        await interaction.followup.send(reply)
-
-
-
-@bot.tree.command(name="summarize", description="Summarise what was said in this channel recently")
-@app_commands.describe(hours=f"How many hours back to read, 1-{RECENT_MESSAGES_MAX_HOURS}")
-async def summarize(interaction: discord.Interaction,
-                    hours: app_commands.Range[int, 1, RECENT_MESSAGES_MAX_HOURS] = 24):
-    await interaction.response.defer()
-
-    started = time.monotonic()
-    calls = []
-    message_count = 0
-    limit_note = ""
-    found_messages: dict[str, dict] = {}
-    try:
-        fetch_started = time.monotonic()
-        recent_messages, message_count, limit_note = await read_recent_messages(
-            interaction.channel, hours, None, found_messages)
-        calls.append({"call": "read_recent_messages", "seconds": round(time.monotonic() - fetch_started, 2),
-                      "outcome": f"{message_count} messages, {hours}h" + (", hit count limit" if limit_note else "")})
-
-        if message_count == 0:
-            response = f"No messages in this channel in the last {hours}h."
-        else:
-            input_messages = [
-                {"role": "system", "content": role_description + emoji_list},
-                {"role": "system", "content": (
-                    "Summarise the channel messages below for someone who missed them. Cover the"
-                    " main topics, who said what when it matters, and anything decided or left"
-                    " open. Use people's names. Keep it short enough to read in a minute.")},
-                {"role": "user", "content": recent_messages},
-            ]
-            # Same fallback as on_message: a 5xx or "at capacity" on 4.3 gets one go on 4.6.
-            summary_model = CHAT_MODEL
-            try:
-                response_obj = await create_chat_response(
-                    input_messages, [], CHAT_MODEL, REASONING_EFFORT, "grokbot-summary",
-                    summary_timeout_seconds, calls)
-            except Exception as e:
-                status_code = getattr(e, "status_code", None)
-                is_at_capacity = status_code == 429 and "capacity" in str(getattr(e, "body", None) or e)
-                if not ((status_code or 0) >= 500 or is_at_capacity):
-                    raise
-                log_error("/summarize fallback", f"{CHAT_MODEL} {type(e).__name__}: {e}", describe_exception(e))
-                summary_model = IMAGE_CHAT_MODEL
-                response_obj = await create_chat_response(
-                    input_messages, [], IMAGE_CHAT_MODEL, IMAGE_REASONING_EFFORT, "grokbot-summary",
-                    summary_timeout_seconds, calls)
-            response = response_obj.output_text or "⚠️ - No response generated"
-            response = re.sub(r"[{\[]image:m\d+[}\]](?!\()", "", response)
-            response = re.sub(r"[{\[](m\d+)[}\]](?!\()", lambda match: found_messages.get(match.group(1), {}).get("link", ""), response)
-            response = re.sub(r"!?\[([^\]]*)\]\(\s*\)", r"\1", response)
-            print(f"¤/summarize answered by {summary_model}")
-
-    except discord.Forbidden:
-        response = "⚠️ - I'm not allowed to read this channel's message history."
-        log_error("/summarize", "Forbidden reading channel history", {"calls": calls})
-    except asyncio.TimeoutError:
-        response = "⚠️ - Request timed out"
-        log_error("/summarize", f"timed out after {summary_timeout_seconds}s", {"calls": calls})
-    except Exception as e:
-        log_error("/summarize", f"{type(e).__name__}: {str(e)}", {**describe_exception(e), "calls": calls})
-        status_code = getattr(e, "status_code", None)
-        rate_limit_reason = str(getattr(e, "body", None) or e)
-        if status_code == 429 and "capacity" in rate_limit_reason:
-            response = "⚠️ - xAI's servers are overloaded right now, not a bot problem. Try again in a few minutes"
-        elif status_code == 429 and "credits" in rate_limit_reason:
-            response = "⚠️ - Out of xAI credits or the monthly spending limit is reached"
-        elif (status_code or 0) >= 500:
-            response = f"⚠️ - xAI had an internal error ({status_code}), not a bot problem. Try again"
-        else:
-            response = "⚠️ - An unexpected error occurred, code: " + str(status_code)
-
-    seconds = round(time.monotonic() - started, 2)
-    print(f"¤/summarize took {seconds}s, calls: {calls}")
-
-    server_name = interaction.guild.name if interaction.guild else "DM"
-    log_interaction(
-        server=server_name,
-        channel=str(interaction.channel),
-        user=interaction.user.name,
-        question=f"[/summarize] {hours}h",
+        question=f"[/search] {question}",
         answer=response,
         seconds=seconds,
         calls=calls,
     )
 
-    reply = f"**Summary of the last {hours}h** ({message_count} messages)"
-    if limit_note:
-        reply += f"\n-# {limit_note}"
-    reply += f"\n\n{response}"
+    reply = f"**Q: {question}**\n\n{response}"
     if len(reply) > 1900:
         await interaction.followup.send(reply[:1900] + "... (message limit reached)")
     else:
@@ -1323,7 +1315,9 @@ async def generate_image(
             ),
             timeout=image_timeout_seconds
         )
-        calls.append({"call": model, "seconds": round(time.monotonic() - started, 2), "outcome": "ok"})
+        image_cost_ticks: Optional[int] = getattr(getattr(response, "usage", None), "cost_in_usd_ticks", None)
+        calls.append({"call": model, "seconds": round(time.monotonic() - started, 2), "outcome": "ok",
+                      "cost_usd": image_cost_ticks / USD_TICKS_PER_DOLLAR if image_cost_ticks is not None else None})
 
         image_urls = [image.url for image in response.data if image.url]
 
@@ -1421,7 +1415,7 @@ async def generate_image(
 @app_commands.choices(
     aspect_ratio=[
         app_commands.Choice(name=ratio, value=ratio)
-        for ratio in ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3"]
+        for ratio in VIDEO_ASPECT_RATIOS
     ],
 )
 async def generate_video(
@@ -1469,7 +1463,7 @@ async def generate_video(
         await interaction.edit_original_response(content="⏳ Generating video…")
 
         try:
-            request_id = await start_video_generation(prompt, image_url, aspect_ratio)
+            request_id = await start_video_generation(prompt, image_url, aspect_ratio, VIDEO_DURATION_SECONDS)
         except Exception as e:
             # Nothing has been generated yet at this point, so a retry is free.
             # The docs say a base64 data uri is accepted, but if this key or model
@@ -1477,13 +1471,16 @@ async def generate_video(
             if image and image_url and image_url.startswith("data:"):
                 log_error("/generate_video", f"inline image rejected, retrying with the Discord link: {e}")
                 image_url = image.url
-                request_id = await start_video_generation(prompt, image_url, aspect_ratio)
+                request_id = await start_video_generation(prompt, image_url, aspect_ratio, VIDEO_DURATION_SECONDS)
             else:
                 raise
 
         print(f"¤/generate_video started {request_id}")
         payload = await poll_video_generation(request_id)
-        calls.append({"call": VIDEO_MODEL, "seconds": round(time.monotonic() - started, 2), "outcome": "ok"})
+        # NOTE: A moderated video is billed too, but it fails before this line, so its cost is not logged.
+        video_cost_ticks: Optional[int] = (payload.get("usage") or {}).get("cost_in_usd_ticks")
+        calls.append({"call": VIDEO_MODEL, "seconds": round(time.monotonic() - started, 2), "outcome": "ok",
+                      "cost_usd": video_cost_ticks / USD_TICKS_PER_DOLLAR if video_cost_ticks is not None else None})
         video_url = (payload.get("video") or {}).get("url")
         if not video_url:
             raise RuntimeError("finished with no video url: " + json.dumps(redact_long_strings(payload))[:400])
@@ -1607,12 +1604,12 @@ async def show_balance(interaction: discord.Interaction):
 
 
 
-async def start_video_generation(prompt: str, image_url: str, aspect_ratio: str) -> str:
+async def start_video_generation(prompt: str, image_url: str, aspect_ratio: str, duration_seconds: int) -> str:
     """Queue a video job and return its id. Nothing is generated yet at this point."""
     body = {
         "model": VIDEO_MODEL,
         "prompt": prompt,
-        "duration": VIDEO_DURATION_SECONDS,
+        "duration": duration_seconds,
         "resolution": VIDEO_RESOLUTION,
     }
     if image_url:
@@ -1628,6 +1625,82 @@ async def start_video_generation(prompt: str, image_url: str, aspect_ratio: str)
         # xAI says what was actually wrong with the request.
         raise RuntimeError(f"start {response.status_code}: {response.text[:400]}")
     return response.json()["request_id"]
+
+
+async def generate_chat_video(message: discord.Message, arguments: dict, image_data_urls: list[str],
+                              calls: list) -> tuple[str, Optional[discord.File], str]:
+    """One generate_video tool call: what to tell Grok, the video as a file, and its url.
+
+    The file is None when nothing was made or it was too big to upload, then the
+    url is posted instead. The url is "" when nothing was made.
+    NOTE: Runs inside on_message's typing(), so the channel shows Grok typing
+    for the minute or so this takes.
+    """
+    prompt: str = str(arguments.get("prompt") or "").strip()
+    if not prompt:
+        return "No video was made, the prompt was empty.", None, ""
+    image_url: Optional[str] = None
+    if arguments.get("image") is not None:
+        try:
+            image_index: int = int(arguments["image"]) - 1
+        except (ValueError, TypeError):
+            image_index = -1
+        if not 0 <= image_index < len(image_data_urls):
+            return (f"No video was made: there is no image {arguments['image']},"
+                    f" the user attached {len(image_data_urls)}."), None, ""
+        image_url = image_data_urls[image_index]
+    aspect_ratio: str = str(arguments.get("aspect_ratio") or "16:9")
+    if aspect_ratio not in VIDEO_ASPECT_RATIOS:
+        aspect_ratio = "16:9"
+
+    started = time.monotonic()
+    outcome = "ok"
+    cost_usd: Optional[float] = None
+    video_url: str = ""
+    try:
+        request_id = await start_video_generation(prompt, image_url, aspect_ratio, CHAT_VIDEO_DURATION_SECONDS)
+        print(f"¤generate_video started {request_id}: {prompt}")
+        payload = await poll_video_generation(request_id)
+        cost_ticks: Optional[int] = (payload.get("usage") or {}).get("cost_in_usd_ticks")
+        if cost_ticks is not None:
+            cost_usd = cost_ticks / USD_TICKS_PER_DOLLAR
+        video_url = (payload.get("video") or {}).get("url") or ""
+    except asyncio.TimeoutError:
+        outcome = "TimeoutError"
+        log_error("generate_video", f"timed out after {video_timeout_seconds}s", {"prompt": prompt})
+    except Exception as e:
+        outcome = type(e).__name__
+        log_error("generate_video", f"{type(e).__name__}: {e}", {**describe_exception(e), "prompt": prompt})
+        if "moderat" in str(e).lower():
+            return "xAI's content filter blocked the video. Tell the user plainly it was blocked.", None, ""
+    finally:
+        calls.append({"call": VIDEO_MODEL, "seconds": round(time.monotonic() - started, 2), "outcome": outcome,
+                      "cost_usd": cost_usd})
+    if not video_url:
+        return "Making the video failed. Tell the user plainly it did not work.", None, ""
+
+    # The vidgen.x.ai link is signed and expires, so the file is uploaded whenever it fits.
+    upload_limit: int = message.guild.filesize_limit if message.guild else 10 * 1024 * 1024
+    video_file: Optional[discord.File] = None
+    download_started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as download_http:
+            download = await download_http.get(video_url)
+        download_outcome = f"HTTP {download.status_code}"
+        if download.status_code >= 400:
+            log_error("generate_video", f"download returned {download.status_code}", {"url": video_url})
+        elif len(download.content) >= upload_limit:
+            download_outcome = "too big"
+            log_error("generate_video", f"too big to upload: {len(download.content)} bytes, limit {upload_limit}")
+        else:
+            video_file = discord.File(io.BytesIO(download.content), filename="grok_video.mp4")
+    except Exception as e:
+        download_outcome = type(e).__name__
+        log_error("generate_video", f"download failed: {type(e).__name__}: {e}", describe_exception(e))
+    calls.append({"call": "download", "seconds": round(time.monotonic() - download_started, 2),
+                  "outcome": download_outcome})
+    return ("The video is done and is attached to your reply. Keep the reply short and do not describe the video.",
+            video_file, video_url)
 
 
 async def poll_video_generation(request_id: str) -> dict:
@@ -1975,15 +2048,16 @@ async def search_messages(message: discord.Message, arguments: dict, found_messa
 
 async def create_chat_response(input_messages: list, tools: list, model: str, effort: str, cache_key: str, timeout: float,
                                calls: list, previous_response_id: str = None):
-    """One chat request. Appends {"call", "seconds", "outcome"} to calls whether it works or not.
+    """One chat request. Appends {"call", "seconds", "outcome", "cost_usd"} to calls whether it works or not.
 
     previous_response_id continues a stored response (xAI keeps them 30 days),
     so input_messages only has to hold what is new, like a function call's result.
     """
     started = time.monotonic()
     outcome = "ok"
+    cost_usd: Optional[float] = None
     try:
-        return await asyncio.wait_for(
+        response_obj = await asyncio.wait_for(
             client.responses.create(
                 model=model,
                 input=input_messages,
@@ -2003,11 +2077,17 @@ async def create_chat_response(input_messages: list, tools: list, model: str, ef
             ),
             timeout=timeout
         )
+        # NOTE: Per xAI's docs this covers the whole request, server side tool calls included.
+        cost_ticks: Optional[int] = getattr(response_obj.usage, "cost_in_usd_ticks", None)
+        if cost_ticks is not None:
+            cost_usd = cost_ticks / USD_TICKS_PER_DOLLAR
+        return response_obj
     except Exception as e:
         outcome = f"{type(e).__name__} {getattr(e, 'status_code', None) or ''}".strip()
         raise
     finally:
-        calls.append({"call": model, "seconds": round(time.monotonic() - started, 2), "outcome": outcome})
+        calls.append({"call": model, "seconds": round(time.monotonic() - started, 2), "outcome": outcome,
+                      "cost_usd": cost_usd})
 
 
 def speaker_label(username: str, nickname: Optional[str]) -> str:
