@@ -14,7 +14,7 @@ import httpx
 from typing import Optional
 from PIL import Image
 from datetime import datetime, timezone, timedelta
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from discord.http import Route
 from openai import AsyncOpenAI, omit
@@ -239,7 +239,7 @@ REASONING_EFFORT = "low"
 IMAGE_REASONING_EFFORT = "low"
 
 # xAI allows 0-2. Above ~1.5 the text starts falling apart.
-CHAT_TEMPERATURE = 1.3
+CHAT_TEMPERATURE = 1.8
 
 # How many attached images one message sends to the model. 5 matches xAI's
 # limit for one multi-image edit (Aug 2026). Each one is billed as image input.
@@ -441,6 +441,9 @@ async def on_ready():
         print(f'¤Synced {len(synced)} command(s)')
     except Exception as e:
         print(f'¤Error syncing commands: {e}')
+    # NOTE: on_ready runs again after every reconnect, so only start it once.
+    if not random_ping_loop.is_running():
+        random_ping_loop.start()
 
 
 role_description = (
@@ -517,6 +520,59 @@ def roll_random_message() -> Optional[tuple[str, list[discord.File]]]:
     if not canned_reply and not canned_files:
         return None
     return canned_reply, canned_files
+
+
+# ── Random pings ─────────────────────────────────────────────────────────────
+# Now and then Grok @'s a random person with a random line, for fun. Who, where
+# and what all come from a private file next to the random messages:
+#   {"channel_id": 123, "user_ids": [123, 456], "messages": ["bitch"]}
+# The chance is per check, not per person, so adding people never makes it
+# happen more often, it only spreads the same pings over more people.
+# NOTE: Read only when the roll hits, so it can be edited and uploaded without a restart.
+RANDOM_PING_FILE = "random_messages/random_pings.json"
+RANDOM_PING_CHECK_MINUTES = 10
+# On average one ping per this many days.
+RANDOM_PING_AVERAGE_DAYS = 6
+
+
+@tasks.loop(minutes=RANDOM_PING_CHECK_MINUTES)
+async def random_ping_loop():
+    ping_chance: float = RANDOM_PING_CHECK_MINUTES / (RANDOM_PING_AVERAGE_DAYS * 24 * 60)
+    if random.random() >= ping_chance:
+        return
+    try:
+        with open(RANDOM_PING_FILE, encoding="utf-8") as random_ping_file:
+            random_ping_config: dict = json.load(random_ping_file)
+        channel_id: int = int(random_ping_config.get("channel_id") or 0)
+        user_ids: list[int] = [int(user_id) for user_id in random_ping_config.get("user_ids") or []]
+        ping_messages: list[str] = [str(ping_message) for ping_message in random_ping_config.get("messages") or []]
+    except FileNotFoundError:
+        return
+    except (ValueError, TypeError, AttributeError) as e:
+        log_error("random ping", f"{RANDOM_PING_FILE} could not be read: {type(e).__name__}: {e}")
+        return
+    if not channel_id or not user_ids or not ping_messages:
+        return
+
+    # NOTE: Checks land on a fixed beat, like 10:10, 10:20 and so on. Waiting a random
+    # part of one interval spreads the ping over the whole window, to the second.
+    await asyncio.sleep(random.uniform(0, RANDOM_PING_CHECK_MINUTES * 60))
+    pinged_user_id: int = random.choice(user_ids)
+    ping_text: str = random.choice(ping_messages)
+    try:
+        ping_channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        await ping_channel.send(f"<@{pinged_user_id}> {ping_text}")
+    except Exception as e:
+        log_error("random ping", f"{type(e).__name__}: {e}", {"channel_id": channel_id, "user_id": pinged_user_id})
+        return
+    print(f"¤Random ping: {pinged_user_id} {ping_text}")
+    log_interaction(
+        server=ping_channel.guild.name if getattr(ping_channel, "guild", None) else "DM",
+        channel=str(ping_channel),
+        user="(random ping)",
+        question=f"[random ping] <@{pinged_user_id}>",
+        answer=ping_text,
+    )
 
 
 @bot.event
